@@ -1,0 +1,8 @@
+[
+  {
+    "key": "ctrl+shift+i",
+    "command": "rust-analyzer.organizeImports",
+    "when": "editorLangId == rust"
+  }
+]
+
