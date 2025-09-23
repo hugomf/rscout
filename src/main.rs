@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use trust_dns_resolver::TokioAsyncResolver;
 use libarp::client::ArpClient;
+use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 
 // ================================================================================================
 // CONFIGURATION & CONSTANTS
@@ -90,6 +91,112 @@ impl From<String> for NetworkDiscoveryError {
     fn from(error: String) -> Self {
         NetworkDiscoveryError::Other(error)
     }
+}
+
+impl From<network_interface::Error> for NetworkDiscoveryError {
+    fn from(error: network_interface::Error) -> Self {
+        NetworkDiscoveryError::NetworkInterfaceError(error.to_string())
+    }
+}
+
+// ================================================================================================
+// HELPER FUNCTIONS FOR NETWORK INTERFACE DETECTION
+// ================================================================================================
+
+/// Parse CIDR network to get network and subnet mask
+fn parse_cidr_network(network: &str) -> Result<(Ipv4Addr, u8), NetworkDiscoveryError> {
+    let parts: Vec<&str> = network.split('/').collect();
+    if parts.len() != 2 {
+        return Err(NetworkDiscoveryError::PingError(
+            "Invalid CIDR format".to_string()
+        ));
+    }
+    
+    let network_ip = Ipv4Addr::from_str(parts[0])
+        .map_err(|e| NetworkDiscoveryError::PingError(format!("Invalid IP address: {}", e)))?;
+    let prefix_len = parts[1].parse::<u8>()
+        .map_err(|e| NetworkDiscoveryError::PingError(format!("Invalid prefix length: {}", e)))?;
+    
+    Ok((network_ip, prefix_len))
+}
+
+/// Check if an IP address is in the same subnet as the network
+fn is_ip_in_subnet(ip: Ipv4Addr, network: Ipv4Addr, prefix_len: u8) -> bool {
+    if prefix_len > 32 {
+        return false;
+    }
+    
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        !((1u32 << (32 - prefix_len)) - 1)
+    };
+    
+    let ip_bits = u32::from(ip);
+    let network_bits = u32::from(network);
+    
+    (ip_bits & mask) == (network_bits & mask)
+}
+
+/// Find the best network interface for ARP operations
+fn find_network_interface(target_network: &str) -> Result<Option<String>, NetworkDiscoveryError> {
+    let (network_ip, prefix_len) = parse_cidr_network(target_network)?;
+    
+    println!("Looking for interface with IP in network: {} (/{}) ", network_ip, prefix_len);
+    
+    let interfaces = NetworkInterface::show()?;
+    
+    // Print all available interfaces for debugging
+    println!("Available network interfaces:");
+    for interface in &interfaces {
+        println!("  Interface: {}", interface.name);
+        for addr in &interface.addr {
+            if let IpAddr::V4(ipv4) = addr.ip() {
+                println!("    IPv4: {}", ipv4);
+                if is_ip_in_subnet(ipv4, network_ip, prefix_len) {
+                    println!("      -> This IP is in target subnet!");
+                }
+            }
+        }
+    }
+    
+    // Find interface with IP in target network
+    for interface in interfaces {
+        for addr in &interface.addr {
+            if let IpAddr::V4(ipv4) = addr.ip() {
+                if is_ip_in_subnet(ipv4, network_ip, prefix_len) {
+                    println!("Selected interface: {} (IP: {})", interface.name, ipv4);
+                    return Ok(Some(interface.name));
+                }
+            }
+        }
+    }
+    
+    // Fallback: try to find a reasonable default interface
+    println!("No interface found in target network, looking for default interface...");
+    let interfaces = NetworkInterface::show()?;
+    
+    for interface in interfaces {
+        // Skip loopback and virtual interfaces
+        if interface.name.starts_with("lo") || 
+           interface.name.starts_with("docker") || 
+           interface.name.starts_with("veth") {
+            continue;
+        }
+        
+        // Look for interfaces with IPv4 addresses
+        for addr in &interface.addr {
+            if let IpAddr::V4(ipv4) = addr.ip() {
+                if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                    println!("Using fallback interface: {} (IP: {})", interface.name, ipv4);
+                    return Ok(Some(interface.name));
+                }
+            }
+        }
+    }
+    
+    println!("Warning: No suitable network interface found for ARP operations");
+    Ok(None)
 }
 
 // ================================================================================================
@@ -173,18 +280,18 @@ pub struct MacVendorDatabase {
 impl MacVendorDatabase {
     /// Create a new MAC vendor database
     pub fn new() -> Result<Self, NetworkDiscoveryError> {
-        println!("📋 Loading OUI database...");
+        println!("Loading OUI database...");
         let file_path = "manuf.txt";
         let oui_db = match OuiDatabase::new_from_file(file_path) {
             Ok(db) => db,
             Err(e) => {
-                eprintln!("⚠️ Failed to load {} from project root: {}", file_path, e);
-                println!("⚠️ Using fallback OUI database (this will result in missing vendor info)");
+                eprintln!("Failed to load {} from project root: {}", file_path, e);
+                println!("Using fallback OUI database (this will result in missing vendor info)");
                 OuiDatabase::new_from_str("")
                     .map_err(|e| NetworkDiscoveryError::OuiDatabaseError(e.to_string()))?
             }
         };
-        println!("✅ OUI database loaded successfully");
+        println!("OUI database loaded successfully");
         Ok(Self {
             oui_db,
             vendor_cache: HashMap::new(),
@@ -583,13 +690,12 @@ impl HostnameAnalysisStrategy {
                 v if v.contains("dahua") => "dahua-camera".to_string(),
                 _ => {
                     if let Some(first_word) = vendor.split_whitespace().next() {
-                        // Corrected line: create a new String and return it
                         first_word.to_lowercase()
                     } else {
                         "device".to_string()
                     }
                 }
-            }.to_string();
+            };
         }
 
         // Fallback to device type if no vendor-based hostname
@@ -669,6 +775,7 @@ impl HostnameAnalysisStrategy {
         self.infer_servers(device, &hostname_lower);
         self.infer_windows_machines(device, &hostname_lower);
         self.infer_smart_tvs(device, &hostname_lower);
+        self.infer_router_os(device, &hostname_lower);
     }
 
     fn infer_apple_devices(&self, device: &mut NetworkDevice, hostname_lower: &str) {
@@ -763,6 +870,18 @@ impl HostnameAnalysisStrategy {
             device.device_type = DeviceType::SmartTV;
         }
     }
+
+    fn infer_router_os(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if device.device_type == DeviceType::Router {
+            if hostname_lower.contains("cisco") || hostname_lower.contains("linksys") {
+                device.operating_system = Some(OperatingSystem::RouterOS);
+                device.vendor = device.vendor.clone().or(Some("Cisco".to_string()));
+            } else if hostname_lower.contains("tplink") || hostname_lower.contains("tp-link") {
+                device.operating_system = Some(OperatingSystem::RouterOS);
+                device.vendor = device.vendor.clone().or(Some("TP-Link".to_string()));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -795,29 +914,6 @@ impl DeviceDetectionStrategy for HostnameAnalysisStrategy {
     }
 }
 
-/// Strategy for analyzing ping responses
-pub struct PingAnalysisStrategy;
-
-impl PingAnalysisStrategy {
-    /// Create a new ping analysis strategy
-    pub fn new() -> Self {
-        PingAnalysisStrategy
-    }
-}
-
-#[async_trait]
-impl DeviceDetectionStrategy for PingAnalysisStrategy {
-    fn name(&self) -> &'static str {
-        "Ping Analysis"
-    }
-
-    async fn detect(&self, _device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
-        // Currently just a placeholder - could be expanded to analyze ping response times
-        // or packet loss to infer device types or network conditions
-        Ok(())
-    }
-}
-
 // ================================================================================================
 // NETWORK DISCOVERY ENGINE
 // ================================================================================================
@@ -838,18 +934,11 @@ impl NetworkDiscovery {
         strategies_vec.push(Box::new(MacAddressStrategy::new(vendor_db.clone())));
         strategies_vec.push(Box::new(PortScanStrategy::new(config.clone())));
         strategies_vec.push(Box::new(HostnameAnalysisStrategy::new()?));
-        strategies_vec.push(Box::new(PingAnalysisStrategy::new()));
         
         Ok(Self {
             strategies: Arc::new(strategies_vec),
             config,
         })
-    }
-
-    /// Add a new detection strategy (for future expansion)
-    pub fn add_strategy(&mut self, _strategy: Box<dyn DeviceDetectionStrategy>) {
-        // Implementation for future expansion
-        // Would need to modify the Arc<Vec<>> to be mutable or use a different data structure
     }
 
     /// Discover devices on the network and display results
@@ -863,14 +952,21 @@ impl NetworkDiscovery {
         let scan_start = Instant::now();
         let active_ips = self.ping_sweep(network).await?;
         
-        println!("📍 Found {} active devices", active_ips.len());
-        println!("🔄 Starting detailed scan...\n");
+        println!("Found {} active devices", active_ips.len());
+        println!("Starting detailed scan...\n");
 
         let discovered_devices = Arc::new(Mutex::new(HashMap::<IpAddr, NetworkDevice>::new()));
         let (tx, mut rx) = mpsc::channel::<NetworkDevice>(active_ips.len());
         
         let total_devices = active_ips.len();
         let mut completed = 0;
+        
+        // Find the appropriate network interface for ARP operations
+        let interface_name_for_arp = find_network_interface(network)?;
+        
+        if interface_name_for_arp.is_none() {
+            println!("Warning: No suitable network interface found. MAC address detection may fail.");
+        }
 
         // Create tasks for scanning each device
         for ip in active_ips {
@@ -878,16 +974,34 @@ impl NetworkDiscovery {
             
             let strategies = self.strategies.clone();
             let tx_clone = tx.clone();
+            let arp_timeout = Duration::from_millis(self.config.ping_timeout_ms);
             
+            let interface_name_for_arp_clone = interface_name_for_arp.clone();
+
             tokio::spawn(async move {
-                let mut client = ArpClient::new().unwrap();
                 let mac = if let IpAddr::V4(ipv4) = ip {
-                    match client.ip_to_mac(ipv4, None).await {
-                        Ok(mac) => Some(mac.to_string().to_uppercase()),
-                        Err(e) => {
-                            eprintln!("ARP error for {}: {}", ipv4, e);
-                            None
+                    if let Some(ref iface_name) = interface_name_for_arp_clone {
+                        match ArpClient::new_with_iface_name(iface_name) {
+                            Ok(mut client) => {
+                                match client.ip_to_mac(ipv4, Some(arp_timeout)).await {
+                                    Ok(mac) => {
+                                        println!("- MAC address found for {}: {}", ip, mac);
+                                        Some(mac.to_string().to_uppercase())
+                                    },
+                                    Err(e) => {
+                                        eprintln!("ARP error for {}: {}", ipv4, e);
+                                        None
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("Failed to create ARP client for interface {}: {}", iface_name, e);
+                                None
+                            }
                         }
+                    } else {
+                        eprintln!("No suitable interface found for ARP operations");
+                        None
                     }
                 } else {
                     None
@@ -921,7 +1035,7 @@ impl NetworkDiscovery {
         // Receive results and update device information
         while let Some(mut device) = rx.recv().await {
             completed += 1;
-            println!("✅ Scanned {}/{} devices", completed, total_devices);
+            println!("Scanned {}/{} devices", completed, total_devices);
             
             let mut devices_map = discovered_devices.lock().await;
             
@@ -956,7 +1070,7 @@ impl NetworkDiscovery {
         // Display results in a table
         let devices_map = discovered_devices.lock().await;
         let mut table = Table::new();
-        table.set_header(vec!["IP", "Hostname", "Vendor", "Type", "OS", "Ports", "Services"]);
+        table.set_header(vec!["IP", "Hostname", "MAC", "Vendor", "Type", "OS", "Ports", "Services"]);
 
         for (_, device) in devices_map.iter() {
             let service_details = if device.services.is_empty() {
@@ -979,13 +1093,18 @@ impl NetworkDiscovery {
 
             let os_string = if let Some(ref os) = device.operating_system {
                 match os {
-                    OperatingSystem::Windows(_) => "Windows".to_string(),
-                    OperatingSystem::MacOS(_) => "macOS".to_string(),
+                    OperatingSystem::Windows(Some(name)) => format!("Windows ({})", name),
+                    OperatingSystem::Windows(None) => "Windows".to_string(),
+                    OperatingSystem::MacOS(Some(name)) => format!("macOS ({})", name),
+                    OperatingSystem::MacOS(None) => "macOS".to_string(),
                     OperatingSystem::Linux(Some(name)) => format!("Linux ({})", name),
                     OperatingSystem::Linux(None) => "Linux".to_string(),
-                    OperatingSystem::IOS(_) => "iOS".to_string(),
-                    OperatingSystem::Android(_) => "Android".to_string(),
+                    OperatingSystem::IOS(Some(name)) => format!("iOS ({})", name),
+                    OperatingSystem::IOS(None) => "iOS".to_string(),
+                    OperatingSystem::Android(Some(name)) => format!("Android ({})", name),
+                    OperatingSystem::Android(None) => "Android".to_string(),
                     OperatingSystem::RouterOS => "RouterOS".to_string(),
+                    OperatingSystem::Other(name) => name.clone(),
                     _ => "Unknown".to_string(),
                 }
             } else {
@@ -995,6 +1114,7 @@ impl NetworkDiscovery {
             table.add_row(vec![
                 Cell::new(device.ip.to_string()),
                 Cell::new(device.hostname.clone().unwrap_or_else(|| "—".to_string())),
+                Cell::new(device.mac.clone().unwrap_or_else(|| "—".to_string())),
                 Cell::new(device.vendor.clone().unwrap_or_else(|| "—".to_string())),
                 Cell::new(format!("{:?}", device.device_type)),
                 Cell::new(os_string),
@@ -1005,7 +1125,7 @@ impl NetworkDiscovery {
 
         println!("{}", table);
         let scan_duration = scan_start.elapsed();
-        println!("\n⏱️  Scan completed in {:.2} seconds", scan_duration.as_secs_f64());
+        println!("\nScan completed in {:.2} seconds", scan_duration.as_secs_f64());
         
         Ok(())
     }
@@ -1069,10 +1189,10 @@ impl NetworkDiscovery {
 
 impl std::fmt::Display for NetworkDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "🖥️  Device: {}", self.ip)?;
+        writeln!(f, "Device: {}", self.ip)?;
         
         if let Some(ref hostname) = self.hostname {
-            writeln!(f, "   📛 Hostname: {}", hostname)?;
+            writeln!(f, "   Hostname: {}", hostname)?;
             if hostname.ends_with(".local") {
                 writeln!(f, "      └─ mDNS/Bonjour device")?;
             }
@@ -1080,33 +1200,33 @@ impl std::fmt::Display for NetworkDevice {
                 writeln!(f, "      └─ Apple ecosystem device")?;
             }
         } else {
-            writeln!(f, "   📛 Hostname: Not resolved")?;
+            writeln!(f, "   Hostname: Not resolved")?;
         }
         
         if let Some(ref mac) = self.mac {
-            writeln!(f, "   🔗 MAC: {}", mac)?;
+            writeln!(f, "   MAC: {}", mac)?;
         }
         
         if let Some(ref vendor) = self.vendor {
-            writeln!(f, "   🏢 Vendor: {}", vendor)?;
+            writeln!(f, "   Vendor: {}", vendor)?;
         }
         
-        writeln!(f, "   📱 Type: {:?}", self.device_type)?;
+        writeln!(f, "   Type: {:?}", self.device_type)?;
         
         if let Some(ref os) = self.operating_system {
-            writeln!(f, "   💻 OS: {:?}", os)?;
+            writeln!(f, "   OS: {:?}", os)?;
         }
         
         if !self.open_ports.is_empty() {
-            writeln!(f, "   🔓 Open Ports: {:?}", self.open_ports)?;
+            writeln!(f, "   Open Ports: {:?}", self.open_ports)?;
         }
         
         if let Some(response_time) = self.response_time {
-            writeln!(f, "   ⚡ Response Time: {:?}", response_time)?;
+            writeln!(f, "   Response Time: {:?}", response_time)?;
         }
         
         if !self.services.is_empty() {
-            writeln!(f, "   🛠️  Services:")?;
+            writeln!(f, "   Services:")?;
             for service in &self.services {
                 let mut service_line = format!("      • {}/{}", service.port, service.protocol);
                 
@@ -1141,7 +1261,7 @@ impl std::fmt::Display for NetworkDevice {
 
 #[tokio::main]
 async fn main() -> Result<(), NetworkDiscoveryError> {
-    println!("🌐 Network Discovery Tool - Rust Implementation");
+    println!("Network Discovery Tool - Rust Implementation");
     println!("================================================");
     
     let args: Vec<String> = std::env::args().collect();
@@ -1151,7 +1271,7 @@ async fn main() -> Result<(), NetworkDiscoveryError> {
         "192.168.1.0/24".to_string()
     };
     
-    println!("🔍 Target network: {}", network);
+    println!("Target network: {}", network);
     println!();
     
     let discovery = NetworkDiscovery::new()?;

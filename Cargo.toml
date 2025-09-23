@@ -22,6 +22,7 @@ futures = "0.3"
 network-interface = "2.0"
 trust-dns-resolver = "0.23"
 arp-toolkit = "0.3.2"
+etherparse = "0.19"
 
 [profile.release]
 opt-level = 3
