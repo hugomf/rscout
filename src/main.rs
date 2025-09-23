@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use surge_ping::ping;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -19,9 +19,86 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 // ================================================================================================
+// CONFIGURATION & CONSTANTS
+// ================================================================================================
+
+#[derive(Debug, Clone)]
+pub struct ScanConfig {
+    pub common_ports: Vec<u16>,
+    pub ping_timeout_ms: u64,
+    pub tcp_connect_timeout_ms: u64,
+    pub banner_read_timeout_ms: u64,
+    pub arp_scan_timeout_secs: u64,
+    pub private_network_ranges: Vec<(u8, u8, u8)>,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            common_ports: vec![
+                21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 993, 995, 1723, 3306, 3389, 5900, 8000, 8080, 8443,
+            ],
+            ping_timeout_ms: 500,
+            tcp_connect_timeout_ms: 300,
+            banner_read_timeout_ms: 500,
+            arp_scan_timeout_secs: 1,
+            private_network_ranges: vec![
+                (192, 168, 0),
+                (10, 0, 0),
+                (172, 16, 0),
+            ],
+        }
+    }
+}
+
+// ================================================================================================
+// CUSTOM ERROR TYPES
+// ================================================================================================
+
+#[derive(Debug)]
+pub enum NetworkDiscoveryError {
+    OuiDatabaseError(String),
+    PingError(String),
+    PortScanError(String),
+    HostnameResolutionError(String),
+    SystemCommandError(String),
+    IoError(std::io::Error),
+    Other(String),
+}
+
+impl std::fmt::Display for NetworkDiscoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkDiscoveryError::OuiDatabaseError(msg) => write!(f, "OUI Database Error: {}", msg),
+            NetworkDiscoveryError::PingError(msg) => write!(f, "Ping Error: {}", msg),
+            NetworkDiscoveryError::PortScanError(msg) => write!(f, "Port Scan Error: {}", msg),
+            NetworkDiscoveryError::HostnameResolutionError(msg) => write!(f, "Hostname Resolution Error: {}", msg),
+            NetworkDiscoveryError::SystemCommandError(msg) => write!(f, "System Command Error: {}", msg),
+            NetworkDiscoveryError::IoError(err) => write!(f, "I/O Error: {}", err),
+            NetworkDiscoveryError::Other(msg) => write!(f, "Error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for NetworkDiscoveryError {}
+
+impl From<std::io::Error> for NetworkDiscoveryError {
+    fn from(error: std::io::Error) -> Self {
+        NetworkDiscoveryError::IoError(error)
+    }
+}
+
+impl From<String> for NetworkDiscoveryError {
+    fn from(error: String) -> Self {
+        NetworkDiscoveryError::Other(error)
+    }
+}
+
+// ================================================================================================
 // CORE DATA STRUCTURES AND TRAITS
 // ================================================================================================
 
+/// Represents a network device discovered during scanning
 #[derive(Debug, Clone)]
 pub struct NetworkDevice {
     pub ip: IpAddr,
@@ -36,6 +113,7 @@ pub struct NetworkDevice {
     pub last_seen: std::time::SystemTime,
 }
 
+/// Enum representing different types of network devices
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeviceType {
     Unknown,
@@ -52,6 +130,7 @@ pub enum DeviceType {
     AppleDevice,
 }
 
+/// Enum representing different operating systems
 #[derive(Debug, Clone, PartialEq)]
 pub enum OperatingSystem {
     Unknown,
@@ -64,6 +143,7 @@ pub enum OperatingSystem {
     Other(String),
 }
 
+/// Represents a network service running on a device
 #[derive(Debug, Clone)]
 pub struct NetworkService {
     pub port: u16,
@@ -74,12 +154,12 @@ pub struct NetworkService {
     pub txt_records: Vec<String>,
 }
 
+/// Trait defining the interface for device detection strategies
 #[async_trait]
 pub trait DeviceDetectionStrategy: Send + Sync {
-    async fn detect(
-        &self,
-        device: &mut NetworkDevice,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Detect device information using this strategy
+    async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError>;
+    /// Return the name of this detection strategy
     fn name(&self) -> &'static str;
 }
 
@@ -87,13 +167,15 @@ pub trait DeviceDetectionStrategy: Send + Sync {
 // MAC ADDRESS VENDOR DATABASE USING OUI
 // ================================================================================================
 
+/// Database for looking up MAC address vendors using OUI
 pub struct MacVendorDatabase {
     oui_db: OuiDatabase,
     vendor_cache: HashMap<String, String>,
 }
 
 impl MacVendorDatabase {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    /// Create a new MAC vendor database
+    pub fn new() -> Result<Self, NetworkDiscoveryError> {
         println!("📋 Loading OUI database...");
         let file_path = "manuf.txt";
         
@@ -102,7 +184,8 @@ impl MacVendorDatabase {
             Err(e) => {
                 eprintln!("⚠️ Failed to load {} from project root: {}", file_path, e);
                 println!("⚠️ Using fallback OUI database (this will result in missing vendor info)");
-                OuiDatabase::new_from_str("")?
+                OuiDatabase::new_from_str("")
+                    .map_err(|e| NetworkDiscoveryError::OuiDatabaseError(e.to_string()))?
             }
         };
         
@@ -113,6 +196,7 @@ impl MacVendorDatabase {
         })
     }
 
+    /// Look up vendor information for a MAC address
     pub fn lookup_vendor(&mut self, mac: &str) -> Option<String> {
         let clean_mac = self.normalize_mac(mac)?;
         if let Some(vendor) = self.vendor_cache.get(&clean_mac) {
@@ -132,6 +216,7 @@ impl MacVendorDatabase {
         }
     }
 
+    /// Get complete device information from MAC address
     pub fn get_device_info(&mut self, mac: &str) -> Option<DeviceInfo> {
         let vendor = self.lookup_vendor(mac)?;
         Some(DeviceInfo {
@@ -141,6 +226,7 @@ impl MacVendorDatabase {
         })
     }
 
+    /// Normalize MAC address format
     fn normalize_mac(&self, mac: &str) -> Option<String> {
         let cleaned = mac.replace("-", ":").replace(".", ":").to_uppercase();
         let parts: Vec<&str> = cleaned.split(':').collect();
@@ -161,6 +247,7 @@ impl MacVendorDatabase {
         }
     }
 
+    /// Infer device type from vendor name
     fn infer_device_type(&self, vendor: &str) -> DeviceType {
         let vendor_lower = vendor.to_lowercase();
         match vendor_lower.as_str() {
@@ -206,6 +293,7 @@ impl MacVendorDatabase {
         }
     }
 
+    /// Infer operating system from vendor name
     fn infer_operating_system(&self, vendor: &str) -> Option<OperatingSystem> {
         let vendor_lower = vendor.to_lowercase();
         match vendor_lower.as_str() {
@@ -224,6 +312,7 @@ impl MacVendorDatabase {
     }
 }
 
+/// Struct containing device information derived from MAC address
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub vendor: String,
@@ -235,11 +324,13 @@ pub struct DeviceInfo {
 // DEVICE DETECTION STRATEGIES
 // ================================================================================================
 
+/// Strategy for detecting devices by analyzing MAC addresses
 pub struct MacAddressStrategy {
-    vendor_db: Arc<Mutex<MacVendorDatabase>>,
+    vendor_db: Arc<Mutex<MacVendorDatabase>>
 }
 
 impl MacAddressStrategy {
+    /// Create a new MAC address detection strategy
     pub fn new(vendor_db: Arc<Mutex<MacVendorDatabase>>) -> Self {
         Self { vendor_db }
     }
@@ -251,10 +342,7 @@ impl DeviceDetectionStrategy for MacAddressStrategy {
         "MAC Address Analysis (OUI Database)"
     }
 
-    async fn detect(
-        &self,
-        device: &mut NetworkDevice,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
         if let Some(ref mac) = device.mac {
             let device_info = {
                 let mut db = self.vendor_db.lock().await;
@@ -275,16 +363,18 @@ impl DeviceDetectionStrategy for MacAddressStrategy {
     }
 }
 
+/// Strategy for detecting devices by scanning open ports
 pub struct PortScanStrategy {
     common_ports: Vec<u16>,
+    config: ScanConfig,
 }
 
 impl PortScanStrategy {
-    pub fn new() -> Self {
+    /// Create a new port scanning strategy
+    pub fn new(config: ScanConfig) -> Self {
         Self {
-            common_ports: vec![
-                21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 993, 995, 1723, 3306, 3389, 5900, 8000, 8080, 8443,
-            ],
+            common_ports: config.common_ports.clone(),
+            config,
         }
     }
 }
@@ -295,18 +385,22 @@ impl DeviceDetectionStrategy for PortScanStrategy {
         "Port Scanning & Banner Grabbing"
     }
 
-    async fn detect(
-        &self,
-        device: &mut NetworkDevice,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
         let ip = device.ip;
         let mut port_handles = Vec::new();
+
+        // 👇 Capture the timeout values here (they are Copy types)
+        let tcp_timeout = Duration::from_millis(self.config.tcp_connect_timeout_ms);
+        let banner_timeout = Duration::from_millis(self.config.banner_read_timeout_ms);
 
         for &port in &self.common_ports {
             let handle = tokio::spawn(async move {
                 let mut open_port_info: Option<(u16, NetworkService)> = None;
                 
-                if let Ok(connect_result) = timeout(Duration::from_millis(300), TcpStream::connect((ip, port))).await {
+                if let Ok(connect_result) = timeout(
+                    tcp_timeout, // 👈 Use the captured value
+                    TcpStream::connect((ip, port))
+                ).await {
                     if let Ok(mut stream) = connect_result {
                         let mut service = NetworkService {
                             port,
@@ -322,10 +416,16 @@ impl DeviceDetectionStrategy for PortScanStrategy {
                         // Send HTTP HEAD request for web ports
                         if port == 80 || port == 443 || port == 8080 || port == 8443 {
                             let request = b"HEAD / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-                            let _ = timeout(Duration::from_millis(300), stream.write_all(request)).await;
+                            let _ = timeout(
+                                tcp_timeout, // 👈 Use the captured value
+                                stream.write_all(request)
+                            ).await;
                         }
 
-                        if let Ok(bytes_read) = timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
+                        if let Ok(bytes_read) = timeout(
+                            banner_timeout, // 👈 Use the captured value
+                            stream.read(&mut buf)
+                        ).await {
                             if let Ok(count) = bytes_read {
                                 if count > 0 {
                                     if let Ok(banner_string) = String::from_utf8(buf[..count].to_vec()) {
@@ -433,6 +533,7 @@ impl DeviceDetectionStrategy for PortScanStrategy {
 }
 
 impl PortScanStrategy {
+    /// Get service name for a given port number
     fn get_service_name(port: u16) -> Option<String> {
         match port {
             21 => Some("FTP".to_string()),
@@ -462,7 +563,17 @@ impl PortScanStrategy {
 }
 
 // Enhanced mDNS strategy with multiple hostname resolution methods
-pub struct ImprovedMdnsStrategy;
+/// Strategy for detecting devices by analyzing hostnames
+pub struct ImprovedMdnsStrategy {
+    config: ScanConfig,
+}
+
+impl ImprovedMdnsStrategy {
+    /// Create a new hostname-based detection strategy
+    pub fn new(config: ScanConfig) -> Self {
+        Self { config }
+    }
+}
 
 #[async_trait]
 impl DeviceDetectionStrategy for ImprovedMdnsStrategy {
@@ -470,14 +581,11 @@ impl DeviceDetectionStrategy for ImprovedMdnsStrategy {
         "Smart Hostname & Device Inference"
     }
 
-    async fn detect(
-        &self,
-        device: &mut NetworkDevice,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
         let ip = device.ip;
         
         // Try a few quick hostname resolution methods
-        let hostname = Self::try_quick_hostname_resolution(ip).await;
+        let hostname = self.try_quick_hostname_resolution(ip).await;
         
         if let Some(ref hostname) = hostname {
             device.hostname = Some(hostname.clone());
@@ -493,28 +601,28 @@ impl DeviceDetectionStrategy for ImprovedMdnsStrategy {
 
 impl ImprovedMdnsStrategy {
     // Try only the most reliable and fast hostname resolution methods
-    async fn try_quick_hostname_resolution(ip: IpAddr) -> Option<String> {
+    async fn try_quick_hostname_resolution(&self, ip: IpAddr) -> Option<String> {
         // Method 1: Check ARP table for existing hostname entries
-        if let Some(hostname) = Self::check_arp_table(ip).await {
+        if let Some(hostname) = self.check_arp_table(ip).await {
             return Some(hostname);
         }
         
         // Method 2: Quick nslookup (shorter timeout)
-        if let Some(hostname) = Self::quick_nslookup(ip).await {
+        if let Some(hostname) = self.quick_nslookup(ip).await {
             return Some(hostname);
         }
         
         // Method 3: Quick dig lookup
-        if let Some(hostname) = Self::quick_dig(ip).await {
+        if let Some(hostname) = self.quick_dig(ip).await {
             return Some(hostname);
         }
         
         None
     }
 
-    async fn check_arp_table(ip: IpAddr) -> Option<String> {
+    async fn check_arp_table(&self, ip: IpAddr) -> Option<String> {
         if let Ok(output) = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(self.config.arp_scan_timeout_secs),
             process::Command::new("arp").arg("-a").output()
         ).await {
             if let Ok(output) = output {
@@ -537,7 +645,7 @@ impl ImprovedMdnsStrategy {
         None
     }
 
-    async fn quick_nslookup(ip: IpAddr) -> Option<String> {
+    async fn quick_nslookup(&self, ip: IpAddr) -> Option<String> {
         if let Ok(output) = tokio::time::timeout(
             Duration::from_secs(2),
             process::Command::new("nslookup").arg(ip.to_string()).output()
@@ -561,7 +669,7 @@ impl ImprovedMdnsStrategy {
         None
     }
 
-    async fn quick_dig(ip: IpAddr) -> Option<String> {
+    async fn quick_dig(&self, ip: IpAddr) -> Option<String> {
         if let Ok(output) = tokio::time::timeout(
             Duration::from_secs(2),
             process::Command::new("dig")
@@ -667,8 +775,19 @@ impl ImprovedMdnsStrategy {
 
     fn infer_from_hostname(&self, device: &mut NetworkDevice, hostname: &str) {
         let hostname_lower = hostname.to_lowercase();
-        
-        // Apple devices
+        self.infer_apple_devices(device, &hostname_lower);
+        self.infer_network_infrastructure(device, &hostname_lower);
+        self.infer_printers(device, &hostname_lower);
+        self.infer_android_devices(device, &hostname_lower);
+        self.infer_google_devices(device, &hostname_lower);
+        self.infer_raspberry_pi(device, &hostname_lower);
+        self.infer_gaming_consoles(device, &hostname_lower);
+        self.infer_servers(device, &hostname_lower);
+        self.infer_windows_machines(device, &hostname_lower);
+        self.infer_smart_tvs(device, &hostname_lower);
+    }
+
+    fn infer_apple_devices(&self, device: &mut NetworkDevice, hostname_lower: &str) {
         if hostname_lower.contains("apple") || hostname_lower.ends_with(".local") {
             if hostname_lower.contains("iphone") {
                 device.device_type = DeviceType::Smartphone;
@@ -688,31 +807,35 @@ impl ImprovedMdnsStrategy {
                 device.vendor = device.vendor.clone().or(Some("Apple".to_string()));
             }
         }
-        
-        // Network infrastructure
+    }
+
+    fn infer_network_infrastructure(&self, device: &mut NetworkDevice, hostname_lower: &str) {
         if hostname_lower.contains("router") || hostname_lower.contains("gateway") || hostname_lower.contains("ap-") {
             device.device_type = DeviceType::Router;
         } else if hostname_lower.contains("switch") {
             device.device_type = DeviceType::Switch;
         }
-        
-        // Printers
-        else if hostname_lower.contains("printer") || hostname_lower.contains("hp-") || 
-                hostname_lower.contains("canon-") || hostname_lower.contains("epson") || 
-                hostname_lower.contains("brother") {
+    }
+
+    fn infer_printers(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if hostname_lower.contains("printer") || hostname_lower.contains("hp-") || 
+           hostname_lower.contains("canon-") || hostname_lower.contains("epson") || 
+           hostname_lower.contains("brother") {
             device.device_type = DeviceType::Printer;
         }
-        
-        // Android devices
-        else if hostname_lower.contains("android") || hostname_lower.contains("samsung") {
+    }
+
+    fn infer_android_devices(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if hostname_lower.contains("android") || hostname_lower.contains("samsung") {
             if device.device_type == DeviceType::Unknown {
                 device.device_type = DeviceType::Smartphone;
             }
             device.operating_system = Some(OperatingSystem::Android(None));
         }
-        
-        // Google devices
-        else if hostname_lower.contains("chromecast") || hostname_lower.contains("google-") || hostname_lower.contains("nest-") {
+    }
+
+    fn infer_google_devices(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if hostname_lower.contains("chromecast") || hostname_lower.contains("google-") || hostname_lower.contains("nest-") {
             if device.device_type == DeviceType::Unknown {
                 device.device_type = if hostname_lower.contains("chromecast") {
                     DeviceType::SmartTV
@@ -722,38 +845,51 @@ impl ImprovedMdnsStrategy {
             }
             device.vendor = device.vendor.clone().or(Some("Google".to_string()));
         }
-        
-        // Raspberry Pi
-        else if hostname_lower.contains("raspberrypi") || hostname_lower.contains("raspberry") {
+    }
+
+    fn infer_raspberry_pi(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if hostname_lower.contains("raspberrypi") || hostname_lower.contains("raspberry") {
             device.device_type = DeviceType::IoTDevice;
             device.operating_system = Some(OperatingSystem::Linux(Some("Raspberry Pi OS".to_string())));
             device.vendor = device.vendor.clone().or(Some("Raspberry Pi Trading Ltd".to_string()));
         }
-        
-        // Gaming consoles
-        else if hostname_lower.contains("xbox") || hostname_lower.contains("playstation") {
+    }
+
+    fn infer_gaming_consoles(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if hostname_lower.contains("xbox") || hostname_lower.contains("playstation") {
             device.device_type = DeviceType::IoTDevice;
         }
-        
-        // Servers
-        else if hostname_lower.contains("server") || hostname_lower.contains("srv") {
+    }
+
+    fn infer_servers(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if hostname_lower.contains("server") || hostname_lower.contains("srv") {
             device.device_type = DeviceType::Server;
         }
-        
-        // Windows machines (often have computer names)
-        else if hostname_lower.contains("desktop") || hostname_lower.contains("laptop") || hostname_lower.contains("pc") {
+    }
+
+    fn infer_windows_machines(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if hostname_lower.contains("desktop") || hostname_lower.contains("laptop") || hostname_lower.contains("pc") {
             device.device_type = DeviceType::Computer;
             device.operating_system = Some(OperatingSystem::Windows(None));
         }
-        
-        // Smart TVs
-        else if hostname_lower.contains("tv") || hostname_lower.contains("roku") || hostname_lower.contains("firetv") {
+    }
+
+    fn infer_smart_tvs(&self, device: &mut NetworkDevice, hostname_lower: &str) {
+        if hostname_lower.contains("tv") || hostname_lower.contains("roku") || hostname_lower.contains("firetv") {
             device.device_type = DeviceType::SmartTV;
         }
     }
 }
 
+/// Strategy for analyzing ping responses
 pub struct PingAnalysisStrategy;
+
+impl PingAnalysisStrategy {
+    /// Create a new ping analysis strategy
+    pub fn new() -> Self {
+        PingAnalysisStrategy
+    }
+}
 
 #[async_trait]
 impl DeviceDetectionStrategy for PingAnalysisStrategy {
@@ -761,10 +897,7 @@ impl DeviceDetectionStrategy for PingAnalysisStrategy {
         "Ping Analysis"
     }
 
-    async fn detect(
-        &self,
-        _device: &mut NetworkDevice,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn detect(&self, _device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
         Ok(())
     }
 }
@@ -773,46 +906,63 @@ impl DeviceDetectionStrategy for PingAnalysisStrategy {
 // NETWORK DISCOVERY ENGINE
 // ================================================================================================
 
+/// Main network discovery engine
 pub struct NetworkDiscovery {
     strategies: Arc<Vec<Box<dyn DeviceDetectionStrategy>>>,
+    config: ScanConfig,
 }
 
 impl NetworkDiscovery {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    /// Create a new network discovery engine
+    pub fn new() -> Result<Self, NetworkDiscoveryError> {
+        let config = ScanConfig::default();
         let vendor_db = Arc::new(Mutex::new(MacVendorDatabase::new()?));
         let mut strategies_vec: Vec<Box<dyn DeviceDetectionStrategy>> = Vec::new();
         
         strategies_vec.push(Box::new(MacAddressStrategy::new(vendor_db.clone())));
-        strategies_vec.push(Box::new(PortScanStrategy::new()));
-        strategies_vec.push(Box::new(ImprovedMdnsStrategy));
+        strategies_vec.push(Box::new(PortScanStrategy::new(config.clone())));
+        strategies_vec.push(Box::new(ImprovedMdnsStrategy::new(config.clone())));
+        strategies_vec.push(Box::new(PingAnalysisStrategy::new()));
         
         Ok(Self {
             strategies: Arc::new(strategies_vec),
+            config,
         })
     }
 
+    /// Add a new detection strategy (for future expansion)
     pub fn add_strategy(&mut self, _strategy: Box<dyn DeviceDetectionStrategy>) {
         // Implementation for future expansion
     }
 
-    pub async fn discover_network_stream(
-        &self,
-        network: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Discover devices on the network and display results
+    pub async fn discover_network_stream(&self, network: &str) -> Result<(), NetworkDiscoveryError> {
+        // Validate network format
+        if !network.contains('/') {
+            return Err(NetworkDiscoveryError::PingError(
+                "Network must be in CIDR format (e.g., 192.168.1.0/24)".to_string()
+            ));
+        }
+
+        let scan_start = Instant::now();
         let active_ips = self.ping_sweep(network).await?;
         println!("📍 Found {} active devices", active_ips.len());
+        println!("🔄 Starting detailed scan...\n");
         
         // This HashMap will store the most up-to-date info for each device
         let discovered_devices = Arc::new(Mutex::new(HashMap::<IpAddr, NetworkDevice>::new()));
         let mut device_task_handles = Vec::new();
-        let mac_addresses = Self::get_mac_address_map().await.unwrap_or_default();
+        let mac_addresses = Arc::new(Self::get_mac_address_map().await.unwrap_or_default());
         let (tx, mut rx) = mpsc::channel::<NetworkDevice>(active_ips.len());
+
+        let total_devices = active_ips.len();
+        let mut completed = 0;
 
         for ip in active_ips {
             println!("- Scanning device {}", ip);
             let strategies = self.strategies.clone();
             let tx_clone = tx.clone();
-            let mac_addresses = mac_addresses.clone();
+            let mac_addresses = Arc::clone(&mac_addresses);
             
             device_task_handles.push(tokio::spawn(async move {
                 let mut device = NetworkDevice {
@@ -840,6 +990,9 @@ impl NetworkDiscovery {
 
         // Wait for all tasks to complete and collect all results
         while let Some(mut device) = rx.recv().await {
+            completed += 1;
+            println!("✅ Scanned {}/{} devices", completed, total_devices);
+            
             let mut devices_map = discovered_devices.lock().await;
             if let Some(existing_device) = devices_map.get_mut(&device.ip) {
                 // Update fields only if they're not already set
@@ -920,12 +1073,19 @@ impl NetworkDiscovery {
         }
         
         println!("{}", table);
+        
+        let scan_duration = scan_start.elapsed();
+        println!("\n⏱️  Scan completed in {:.2} seconds", scan_duration.as_secs_f64());
         Ok(())
     }
 
-    async fn ping_sweep(&self, network: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    /// Perform a ping sweep to find active devices on the network
+    async fn ping_sweep(&self, network: &str) -> Result<Vec<IpAddr>, NetworkDiscoveryError> {
         let mut active_ips = Vec::new();
         
+        // 👇 Capture the timeout value here (it's a Copy type)
+        let ping_timeout = Duration::from_millis(self.config.ping_timeout_ms);
+
         if let Some(base) = network.strip_suffix("/24") {
             let base_parts: Vec<&str> = base.split('.').collect();
             if base_parts.len() == 4 {
@@ -938,7 +1098,7 @@ impl NetworkDiscovery {
                         let target_ip: IpAddr = ip.into();
                         let handle = tokio::spawn(async move {
                             let payload = [0; 56];
-                            match timeout(Duration::from_millis(500), ping(target_ip, &payload)).await {
+                            match timeout(ping_timeout, ping(target_ip, &payload)).await { // 👈 Use the captured value
                                 Ok(Ok((_icmp_packet, _duration))) => {
                                     Some(target_ip)
                                 },
@@ -964,6 +1124,7 @@ impl NetworkDiscovery {
         Ok(active_ips)
     }
 
+    /// Get MAC address map from system ARP tables
     async fn get_mac_address_map() -> Option<HashMap<IpAddr, String>> {
         let mut mac_map = HashMap::new();
         
@@ -998,6 +1159,7 @@ impl NetworkDiscovery {
         Some(mac_map)
     }
 
+    /// Get MAC addresses from 'arp -a' command
     async fn get_mac_from_arp() -> Option<HashMap<IpAddr, String>> {
         let mut mac_map = HashMap::new();
         
@@ -1029,6 +1191,7 @@ impl NetworkDiscovery {
         Some(mac_map)
     }
 
+    /// Get MAC addresses from 'ip neighbor' command (Linux)
     #[cfg(target_os = "linux")]
     async fn get_mac_from_ip_neighbor() -> Option<HashMap<IpAddr, String>> {
         let mut mac_map = HashMap::new();
@@ -1063,6 +1226,7 @@ impl NetworkDiscovery {
         Some(mac_map)
     }
 
+    /// Get MAC addresses from 'arp -a -n' command
     async fn get_mac_from_arp_no_resolve() -> Option<HashMap<IpAddr, String>> {
         let mut mac_map = HashMap::new();
         
@@ -1158,7 +1322,7 @@ impl std::fmt::Display for NetworkDevice {
 // ================================================================================================
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), NetworkDiscoveryError> {
     println!("🌐 Network Discovery Tool - Rust Implementation");
     println!("================================================");
     
@@ -1178,6 +1342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+/// Get the local network based on system configuration
 fn get_local_network() -> Option<String> {
     #[cfg(target_os = "linux")]
     if let Ok(output) = Command::new("ip")
