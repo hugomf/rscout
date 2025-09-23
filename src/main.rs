@@ -2,21 +2,23 @@ use async_trait::async_trait;
 use comfy_table::{Cell, Table};
 use eui48::MacAddress;
 use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use oui::OuiDatabase;
-use regex::Regex;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use surge_ping::ping;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::process;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+
+use trust_dns_resolver::TokioAsyncResolver;
+use libarp::client::ArpClient;
+
 
 // ================================================================================================
 // CONFIGURATION & CONSTANTS
@@ -28,7 +30,6 @@ pub struct ScanConfig {
     pub ping_timeout_ms: u64,
     pub tcp_connect_timeout_ms: u64,
     pub banner_read_timeout_ms: u64,
-    pub arp_scan_timeout_secs: u64,
     pub private_network_ranges: Vec<(u8, u8, u8)>,
 }
 
@@ -41,7 +42,6 @@ impl Default for ScanConfig {
             ping_timeout_ms: 500,
             tcp_connect_timeout_ms: 300,
             banner_read_timeout_ms: 500,
-            arp_scan_timeout_secs: 1,
             private_network_ranges: vec![
                 (192, 168, 0),
                 (10, 0, 0),
@@ -61,8 +61,8 @@ pub enum NetworkDiscoveryError {
     PingError(String),
     PortScanError(String),
     HostnameResolutionError(String),
-    SystemCommandError(String),
     IoError(std::io::Error),
+    NetworkInterfaceError(String),
     Other(String),
 }
 
@@ -73,8 +73,8 @@ impl std::fmt::Display for NetworkDiscoveryError {
             NetworkDiscoveryError::PingError(msg) => write!(f, "Ping Error: {}", msg),
             NetworkDiscoveryError::PortScanError(msg) => write!(f, "Port Scan Error: {}", msg),
             NetworkDiscoveryError::HostnameResolutionError(msg) => write!(f, "Hostname Resolution Error: {}", msg),
-            NetworkDiscoveryError::SystemCommandError(msg) => write!(f, "System Command Error: {}", msg),
             NetworkDiscoveryError::IoError(err) => write!(f, "I/O Error: {}", err),
+            NetworkDiscoveryError::NetworkInterfaceError(msg) => write!(f, "Network Interface Error: {}", msg),
             NetworkDiscoveryError::Other(msg) => write!(f, "Error: {}", msg),
         }
     }
@@ -93,7 +93,6 @@ impl From<String> for NetworkDiscoveryError {
         NetworkDiscoveryError::Other(error)
     }
 }
-
 // ================================================================================================
 // CORE DATA STRUCTURES AND TRAITS
 // ================================================================================================
@@ -166,8 +165,6 @@ pub trait DeviceDetectionStrategy: Send + Sync {
 // ================================================================================================
 // MAC ADDRESS VENDOR DATABASE USING OUI
 // ================================================================================================
-
-/// Database for looking up MAC address vendors using OUI
 pub struct MacVendorDatabase {
     oui_db: OuiDatabase,
     vendor_cache: HashMap<String, String>,
@@ -311,7 +308,6 @@ impl MacVendorDatabase {
         }
     }
 }
-
 /// Struct containing device information derived from MAC address
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -319,7 +315,6 @@ pub struct DeviceInfo {
     pub device_type: DeviceType,
     pub operating_system: Option<OperatingSystem>,
 }
-
 // ================================================================================================
 // DEVICE DETECTION STRATEGIES
 // ================================================================================================
@@ -389,7 +384,6 @@ impl DeviceDetectionStrategy for PortScanStrategy {
         let ip = device.ip;
         let mut port_handles = Vec::new();
 
-        // 👇 Capture the timeout values here (they are Copy types)
         let tcp_timeout = Duration::from_millis(self.config.tcp_connect_timeout_ms);
         let banner_timeout = Duration::from_millis(self.config.banner_read_timeout_ms);
 
@@ -398,7 +392,7 @@ impl DeviceDetectionStrategy for PortScanStrategy {
                 let mut open_port_info: Option<(u16, NetworkService)> = None;
                 
                 if let Ok(connect_result) = timeout(
-                    tcp_timeout, // 👈 Use the captured value
+                    tcp_timeout,
                     TcpStream::connect((ip, port))
                 ).await {
                     if let Ok(mut stream) = connect_result {
@@ -413,17 +407,16 @@ impl DeviceDetectionStrategy for PortScanStrategy {
 
                         let mut buf = vec![0; 1024];
                         
-                        // Send HTTP HEAD request for web ports
                         if port == 80 || port == 443 || port == 8080 || port == 8443 {
                             let request = b"HEAD / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n";
                             let _ = timeout(
-                                tcp_timeout, // 👈 Use the captured value
+                                tcp_timeout,
                                 stream.write_all(request)
                             ).await;
                         }
 
                         if let Ok(bytes_read) = timeout(
-                            banner_timeout, // 👈 Use the captured value
+                            banner_timeout,
                             stream.read(&mut buf)
                         ).await {
                             if let Ok(count) = bytes_read {
@@ -457,11 +450,9 @@ impl DeviceDetectionStrategy for PortScanStrategy {
             }
         }
 
-        // Remove duplicates and sort
         device.open_ports.sort();
         device.open_ports.dedup();
 
-        // Final inference pass after all ports have been scanned
         let mut has_web_server = false;
         let mut has_windows_service = false;
         let mut has_ssh = false;
@@ -511,7 +502,6 @@ impl DeviceDetectionStrategy for PortScanStrategy {
             }
         }
 
-        // Final inferences based on combined results
         if device.operating_system.is_none() {
             if has_windows_service {
                 device.operating_system = Some(OperatingSystem::Windows(None));
@@ -533,7 +523,6 @@ impl DeviceDetectionStrategy for PortScanStrategy {
 }
 
 impl PortScanStrategy {
-    /// Get service name for a given port number
     fn get_service_name(port: u16) -> Option<String> {
         match port {
             21 => Some("FTP".to_string()),
@@ -562,21 +551,21 @@ impl PortScanStrategy {
     }
 }
 
-// Enhanced mDNS strategy with multiple hostname resolution methods
 /// Strategy for detecting devices by analyzing hostnames
-pub struct ImprovedMdnsStrategy {
-    config: ScanConfig,
+pub struct HostnameAnalysisStrategy {
+    resolver: TokioAsyncResolver,
 }
 
-impl ImprovedMdnsStrategy {
-    /// Create a new hostname-based detection strategy
-    pub fn new(config: ScanConfig) -> Self {
-        Self { config }
+impl HostnameAnalysisStrategy {
+    pub fn new() -> Result<Self, NetworkDiscoveryError> {
+        let resolver = TokioAsyncResolver::tokio_from_system_conf()
+            .map_err(|e| NetworkDiscoveryError::HostnameResolutionError(e.to_string()))?;
+        Ok(Self { resolver })
     }
 }
 
 #[async_trait]
-impl DeviceDetectionStrategy for ImprovedMdnsStrategy {
+impl DeviceDetectionStrategy for HostnameAnalysisStrategy {
     fn name(&self) -> &'static str {
         "Smart Hostname & Device Inference"
     }
@@ -584,14 +573,20 @@ impl DeviceDetectionStrategy for ImprovedMdnsStrategy {
     async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
         let ip = device.ip;
         
-        // Try a few quick hostname resolution methods
-        let hostname = self.try_quick_hostname_resolution(ip).await;
+        let hostname = if let Ok(reverse_lookup) = self.resolver.reverse_lookup(ip).await {
+            reverse_lookup
+                .iter()
+                .next()
+                // FIX: Use `trim_end_matches` to remove a specific character.
+                .map(|name| name.to_string().trim_end_matches('.').to_string())
+        } else {
+            None
+        };
         
         if let Some(ref hostname) = hostname {
             device.hostname = Some(hostname.clone());
             self.infer_from_hostname(device, hostname);
         } else {
-            // Generate smart hostname based on available information
             self.generate_smart_hostname(device);
         }
         
@@ -599,102 +594,10 @@ impl DeviceDetectionStrategy for ImprovedMdnsStrategy {
     }
 }
 
-impl ImprovedMdnsStrategy {
-    // Try only the most reliable and fast hostname resolution methods
-    async fn try_quick_hostname_resolution(&self, ip: IpAddr) -> Option<String> {
-        // Method 1: Check ARP table for existing hostname entries
-        if let Some(hostname) = self.check_arp_table(ip).await {
-            return Some(hostname);
-        }
-        
-        // Method 2: Quick nslookup (shorter timeout)
-        if let Some(hostname) = self.quick_nslookup(ip).await {
-            return Some(hostname);
-        }
-        
-        // Method 3: Quick dig lookup
-        if let Some(hostname) = self.quick_dig(ip).await {
-            return Some(hostname);
-        }
-        
-        None
-    }
-
-    async fn check_arp_table(&self, ip: IpAddr) -> Option<String> {
-        if let Ok(output) = tokio::time::timeout(
-            Duration::from_secs(self.config.arp_scan_timeout_secs),
-            process::Command::new("arp").arg("-a").output()
-        ).await {
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let response = String::from_utf8_lossy(&output.stdout);
-                    for line in response.lines() {
-                        if line.contains(&format!("({})", ip)) {
-                            // Extract anything before the IP that's not just "?"
-                            if let Some(ip_start) = line.find(&format!("({})", ip)) {
-                                let hostname_part = line[..ip_start].trim();
-                                if !hostname_part.is_empty() && hostname_part != "?" {
-                                    return Some(hostname_part.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    async fn quick_nslookup(&self, ip: IpAddr) -> Option<String> {
-        if let Ok(output) = tokio::time::timeout(
-            Duration::from_secs(2),
-            process::Command::new("nslookup").arg(ip.to_string()).output()
-        ).await {
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let response = String::from_utf8_lossy(&output.stdout);
-                    for line in response.lines() {
-                        if line.contains("name =") {
-                            if let Some(name_start) = line.find("name = ") {
-                                let hostname = line[name_start + 7..].trim().trim_end_matches('.');
-                                if !hostname.is_empty() && hostname != ip.to_string() {
-                                    return Some(hostname.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    async fn quick_dig(&self, ip: IpAddr) -> Option<String> {
-        if let Ok(output) = tokio::time::timeout(
-            Duration::from_secs(2),
-            process::Command::new("dig")
-                .arg("-x")
-                .arg(ip.to_string())
-                .arg("+short")
-                .output()
-        ).await {
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !response.is_empty() && response != ip.to_string() {
-                        return Some(response.trim_end_matches('.').to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    // Generate meaningful hostnames based on device characteristics
+impl HostnameAnalysisStrategy {
     fn generate_smart_hostname(&self, device: &mut NetworkDevice) {
         let mut hostname = String::new();
         
-        // Base hostname on vendor and device type
         if let Some(ref vendor) = device.vendor {
             let vendor_lower = vendor.to_lowercase();
             if vendor_lower.contains("bose") {
@@ -708,14 +611,12 @@ impl ImprovedMdnsStrategy {
             } else if vendor_lower.contains("dahua") {
                 hostname = "dahua-camera".to_string();
             } else {
-                // Use first word of vendor
                 if let Some(first_word) = vendor.split_whitespace().next() {
                     hostname = first_word.to_lowercase();
                 }
             }
         }
         
-        // If no vendor-based name, use device type
         if hostname.is_empty() {
             hostname = match device.device_type {
                 DeviceType::Router => "router".to_string(),
@@ -728,27 +629,22 @@ impl ImprovedMdnsStrategy {
             };
         }
         
-        // Add device characteristics based on open ports/services
         if !device.open_ports.is_empty() {
             if device.open_ports.contains(&22) && !hostname.contains("ssh") {
                 hostname.push_str("-ssh");
             }
-            
             if (device.open_ports.contains(&80) || device.open_ports.contains(&443)) && 
                device.device_type == DeviceType::Router && !hostname.contains("web") {
                 hostname.push_str("-admin");
             }
-            
             if device.open_ports.contains(&3389) {
                 hostname.push_str("-rdp");
             }
-            
             if device.open_ports.contains(&5900) {
                 hostname.push_str("-vnc");
             }
         }
         
-        // Add service-specific suffixes based on banners
         for service in &device.services {
             if let Some(ref banner) = service.banner {
                 let banner_lower = banner.to_lowercase();
@@ -764,11 +660,8 @@ impl ImprovedMdnsStrategy {
             }
         }
         
-        // Add IP suffix to make it unique
         let ip_suffix = device.ip.to_string().replace(".", "-");
         hostname.push_str(&format!("-{}", ip_suffix.split('-').last().unwrap_or("x")));
-        
-        // Add .local suffix
         hostname.push_str(".local");
         device.hostname = Some(hostname);
     }
@@ -786,7 +679,7 @@ impl ImprovedMdnsStrategy {
         self.infer_windows_machines(device, &hostname_lower);
         self.infer_smart_tvs(device, &hostname_lower);
     }
-
+    
     fn infer_apple_devices(&self, device: &mut NetworkDevice, hostname_lower: &str) {
         if hostname_lower.contains("apple") || hostname_lower.ends_with(".local") {
             if hostname_lower.contains("iphone") {
@@ -880,7 +773,6 @@ impl ImprovedMdnsStrategy {
         }
     }
 }
-
 /// Strategy for analyzing ping responses
 pub struct PingAnalysisStrategy;
 
@@ -921,7 +813,7 @@ impl NetworkDiscovery {
         
         strategies_vec.push(Box::new(MacAddressStrategy::new(vendor_db.clone())));
         strategies_vec.push(Box::new(PortScanStrategy::new(config.clone())));
-        strategies_vec.push(Box::new(ImprovedMdnsStrategy::new(config.clone())));
+        strategies_vec.push(Box::new(HostnameAnalysisStrategy::new()?));
         strategies_vec.push(Box::new(PingAnalysisStrategy::new()));
         
         Ok(Self {
@@ -937,7 +829,6 @@ impl NetworkDiscovery {
 
     /// Discover devices on the network and display results
     pub async fn discover_network_stream(&self, network: &str) -> Result<(), NetworkDiscoveryError> {
-        // Validate network format
         if !network.contains('/') {
             return Err(NetworkDiscoveryError::PingError(
                 "Network must be in CIDR format (e.g., 192.168.1.0/24)".to_string()
@@ -949,25 +840,40 @@ impl NetworkDiscovery {
         println!("📍 Found {} active devices", active_ips.len());
         println!("🔄 Starting detailed scan...\n");
         
-        // This HashMap will store the most up-to-date info for each device
         let discovered_devices = Arc::new(Mutex::new(HashMap::<IpAddr, NetworkDevice>::new()));
         let mut device_task_handles = Vec::new();
-        let mac_addresses = Arc::new(Self::get_mac_address_map().await.unwrap_or_default());
         let (tx, mut rx) = mpsc::channel::<NetworkDevice>(active_ips.len());
 
         let total_devices = active_ips.len();
         let mut completed = 0;
 
+       
+
         for ip in active_ips {
             println!("- Scanning device {}", ip);
             let strategies = self.strategies.clone();
             let tx_clone = tx.clone();
-            let mac_addresses = Arc::clone(&mac_addresses);
             
             device_task_handles.push(tokio::spawn(async move {
+
+                let mut client = ArpClient::new().unwrap();
+                let mac = if let IpAddr::V4(ipv4) = ip {
+                    // FIX: Await the `ip_to_mac` method and handle the result
+                     match client.ip_to_mac(ipv4, None).await {
+                        Ok(mac) => Some(mac.to_string().to_uppercase()),
+                        Err(e) => {
+                            eprintln!("ARP error for {}: {}", ipv4, e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+
                 let mut device = NetworkDevice {
                     ip,
-                    mac: mac_addresses.get(&ip).cloned(),
+                    mac,
                     hostname: None,
                     vendor: None,
                     device_type: DeviceType::Unknown,
@@ -988,14 +894,12 @@ impl NetworkDiscovery {
         
         drop(tx); 
 
-        // Wait for all tasks to complete and collect all results
         while let Some(mut device) = rx.recv().await {
             completed += 1;
             println!("✅ Scanned {}/{} devices", completed, total_devices);
             
             let mut devices_map = discovered_devices.lock().await;
             if let Some(existing_device) = devices_map.get_mut(&device.ip) {
-                // Update fields only if they're not already set
                 if existing_device.mac.is_none() { 
                     existing_device.mac = device.mac.take(); 
                 }
@@ -1012,7 +916,6 @@ impl NetworkDiscovery {
                     existing_device.operating_system = device.operating_system.take(); 
                 }
                 
-                // Merge ports and services
                 existing_device.open_ports.extend(device.open_ports.iter().cloned());
                 existing_device.open_ports.sort();
                 existing_device.open_ports.dedup();
@@ -1022,7 +925,6 @@ impl NetworkDiscovery {
             }
         }
 
-        // Display results
         let devices_map = discovered_devices.lock().await;
         let mut table = Table::new();
         table.set_header(vec!["IP", "Hostname", "Vendor", "Type", "OS", "Ports", "Services"]);
@@ -1081,24 +983,22 @@ impl NetworkDiscovery {
 
     /// Perform a ping sweep to find active devices on the network
     async fn ping_sweep(&self, network: &str) -> Result<Vec<IpAddr>, NetworkDiscoveryError> {
-        let mut active_ips = Vec::new();
-        
-        // 👇 Capture the timeout value here (it's a Copy type)
-        let ping_timeout = Duration::from_millis(self.config.ping_timeout_ms);
+    let ping_timeout = Duration::from_millis(self.config.ping_timeout_ms);
+    if let Some(base) = network.strip_suffix("/24") {
+        let base_parts: Vec<&str> = base.split('.').collect();
+        if base_parts.len() == 4 {
+            let base_ip_str = format!("{}.{}.{}.", base_parts[0], base_parts[1], base_parts[2]);
 
-        if let Some(base) = network.strip_suffix("/24") {
-            let base_parts: Vec<&str> = base.split('.').collect();
-            if base_parts.len() == 4 {
-                let base_ip_str = format!("{}.{}.{}.", base_parts[0], base_parts[1], base_parts[2]);
-                let mut handles = Vec::new();
-                
-                for i in 1..255 {
+            // Create a stream of futures for pinging each IP
+            let ping_stream = stream::iter(1..255)
+                .map(|i| {
                     let ip_str = format!("{}{}", base_ip_str, i);
-                    if let Ok(ip) = Ipv4Addr::from_str(&ip_str) {
-                        let target_ip: IpAddr = ip.into();
-                        let handle = tokio::spawn(async move {
+                    let ping_timeout = ping_timeout; // Capture for the closure
+                    async move {
+                        if let Ok(ip) = Ipv4Addr::from_str(&ip_str) {
+                            let target_ip: IpAddr = ip.into();
                             let payload = [0; 56];
-                            match timeout(ping_timeout, ping(target_ip, &payload)).await { // 👈 Use the captured value
+                            match timeout(ping_timeout, ping(target_ip, &payload)).await {
                                 Ok(Ok((_icmp_packet, _duration))) => {
                                     Some(target_ip)
                                 },
@@ -1108,152 +1008,24 @@ impl NetworkDiscovery {
                                 },
                                 Err(_) => None,
                             }
-                        });
-                        handles.push(handle);
-                    }
-                }
-                
-                for handle in handles {
-                    if let Ok(Some(ip)) = handle.await {
-                        active_ips.push(ip);
-                    }
-                }
-            }
-        }
-        
-        Ok(active_ips)
-    }
-
-    /// Get MAC address map from system ARP tables
-    async fn get_mac_address_map() -> Option<HashMap<IpAddr, String>> {
-        let mut mac_map = HashMap::new();
-        
-        // Try multiple methods for getting MAC addresses
-        let mut methods = Vec::new();
-        
-        // Method 1: arp -a
-        methods.push(tokio::spawn(async {
-            Self::get_mac_from_arp().await.unwrap_or_default()
-        }));
-        
-        // Method 2: ip neighbor (Linux)
-        #[cfg(target_os = "linux")]
-        methods.push(tokio::spawn(async {
-            Self::get_mac_from_ip_neighbor().await.unwrap_or_default()
-        }));
-        
-        // Method 3: arp -a -n (no name resolution)
-        methods.push(tokio::spawn(async {
-            Self::get_mac_from_arp_no_resolve().await.unwrap_or_default()
-        }));
-        
-        // Collect results from all methods
-        for method in methods {
-            if let Ok(result) = method.await {
-                for (ip, mac) in result {
-                    mac_map.entry(ip).or_insert(mac);
-                }
-            }
-        }
-        
-        Some(mac_map)
-    }
-
-    /// Get MAC addresses from 'arp -a' command
-    async fn get_mac_from_arp() -> Option<HashMap<IpAddr, String>> {
-        let mut mac_map = HashMap::new();
-        
-        if let Ok(output) = process::Command::new("arp")
-            .arg("-a")
-            .output()
-            .await {
-            if output.status.success() {
-                let response = String::from_utf8_lossy(&output.stdout);
-                let mac_pattern = Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
-                
-                for line in response.lines() {
-                    // Multiple formats to handle
-                    // Format 1: ? (192.168.1.1) at 12:34:56:78:90:ab [ether] on en0
-                    // Format 2: hostname (192.168.1.1) at 12:34:56:78:90:ab on en0
-                    if let Some(ip_start) = line.find('(') {
-                        if let Some(ip_end) = line.find(')') {
-                            if let Ok(ip) = IpAddr::from_str(&line[ip_start + 1..ip_end]) {
-                                if let Some(mat) = mac_pattern.find(line) {
-                                    mac_map.insert(ip, mat.as_str().replace('-', ":").to_uppercase());
-                                }
-                            }
+                        } else {
+                            None
                         }
                     }
-                }
-            }
-        }
-        
-        Some(mac_map)
-    }
+                })
+                // Limit concurrency to, say, 64 pings at a time
+                .buffer_unordered(64);
 
-    /// Get MAC addresses from 'ip neighbor' command (Linux)
-    #[cfg(target_os = "linux")]
-    async fn get_mac_from_ip_neighbor() -> Option<HashMap<IpAddr, String>> {
-        let mut mac_map = HashMap::new();
-        
-        if let Ok(output) = process::Command::new("ip")
-            .arg("neighbor")
-            .arg("show")
-            .output()
-            .await {
-            if output.status.success() {
-                let response = String::from_utf8_lossy(&output.stdout);
-                for line in response.lines() {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 5 {
-                        if let Ok(ip) = IpAddr::from_str(parts[0]) {
-                            // Look for MAC address in the line (lladdr field)
-                            if let Some(pos) = parts.iter().position(|&x| x == "lladdr") {
-                                if pos + 1 < parts.len() {
-                                    let mac = parts[pos + 1].replace('-', ":").to_uppercase();
-                                    // Validate MAC format
-                                    if mac.len() == 17 && mac.matches(':').count() == 5 {
-                                        mac_map.insert(ip, mac);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        Some(mac_map)
-    }
+            // Collect results as they come in
+            let active_ips: Vec<IpAddr> = ping_stream
+                .filter_map(|result| async move { result }) // Filter out `None` values
+                .collect()
+                .await;
 
-    /// Get MAC addresses from 'arp -a -n' command
-    async fn get_mac_from_arp_no_resolve() -> Option<HashMap<IpAddr, String>> {
-        let mut mac_map = HashMap::new();
-        
-        if let Ok(output) = process::Command::new("arp")
-            .arg("-a")
-            .arg("-n") // Don't resolve hostnames
-            .output()
-            .await {
-            if output.status.success() {
-                let response = String::from_utf8_lossy(&output.stdout);
-                let mac_pattern = Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
-                
-                for line in response.lines() {
-                    if let Some(ip_start) = line.find('(') {
-                        if let Some(ip_end) = line.find(')') {
-                            if let Ok(ip) = IpAddr::from_str(&line[ip_start + 1..ip_end]) {
-                                if let Some(mat) = mac_pattern.find(line) {
-                                    mac_map.insert(ip, mat.as_str().replace('-', ":").to_uppercase());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            return Ok(active_ips);
         }
-        
-        Some(mac_map)
+    }
+    Ok(Vec::new()) // Return empty vec if CIDR format is not /24 or parsing fails
     }
 }
 
@@ -1266,7 +1038,6 @@ impl std::fmt::Display for NetworkDevice {
         writeln!(f, "🖥️  Device: {}", self.ip)?;
         if let Some(ref hostname) = self.hostname {
             writeln!(f, "   📛 Hostname: {}", hostname)?;
-            // Show additional hostname insights
             if hostname.ends_with(".local") {
                 writeln!(f, "      └─ mDNS/Bonjour device")?;
             }
@@ -1330,11 +1101,12 @@ async fn main() -> Result<(), NetworkDiscoveryError> {
     let network = if args.len() > 1 {
         args[1].clone()
     } else {
-        get_local_network().unwrap_or_else(|| "192.168.1.0/24".to_string())
+        //get_local_network().unwrap_or_else(|| "192.168.1.0/24".to_string())
+        "192.168.1.0/24".to_string()
     };
     
     println!("🔍 Target network: {}", network);
-    println!(); // Add spacing
+    println!();
     
     let discovery = NetworkDiscovery::new()?;
     discovery.discover_network_stream(&network).await?;
@@ -1342,88 +1114,3 @@ async fn main() -> Result<(), NetworkDiscoveryError> {
     Ok(())
 }
 
-/// Get the local network based on system configuration
-fn get_local_network() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    if let Ok(output) = Command::new("ip")
-        .arg("route")
-        .arg("show")
-        .arg("default")
-        .output()
-    {
-        if output.status.success() {
-            let response = String::from_utf8_lossy(&output.stdout);
-            for line in response.lines() {
-                if line.contains("default via") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    for (i, part) in parts.iter().enumerate() {
-                        if *part == "via" && i + 1 < parts.len() {
-                            let gateway = parts[i + 1];
-                            if let Ok(gateway_ip) = Ipv4Addr::from_str(gateway) {
-                                let octets = gateway_ip.octets();
-                                return Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    #[cfg(target_os = "macos")]
-    if let Ok(output) = Command::new("netstat")
-        .arg("-rn")
-        .output()
-    {
-        if output.status.success() {
-            let response = String::from_utf8_lossy(&output.stdout);
-            for line in response.lines() {
-                if line.trim().starts_with("default") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        let gateway = parts[1];
-                        if let Ok(gateway_ip) = Ipv4Addr::from_str(gateway) {
-                            let octets = gateway_ip.octets();
-                            return Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    if let Ok(output) = Command::new("hostname").arg("-I").output() {
-        if output.status.success() {
-            let response = String::from_utf8_lossy(&output.stdout);
-            let ips: Vec<&str> = response.split_whitespace().collect();
-            for ip_str in ips {
-                if let Ok(ip) = Ipv4Addr::from_str(ip_str.trim()) {
-                    let octets = ip.octets();
-                    if (octets[0] == 192 && octets[1] == 168)
-                        || (octets[0] == 10)
-                        || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
-                    {
-                        return Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]));
-                    }
-                }
-            }
-        }
-    }
-    
-    #[cfg(target_os = "macos")]
-    if let Ok(output) = Command::new("ipconfig")
-        .arg("getifaddr")
-        .arg("en0")
-        .output()
-    {
-        if output.status.success() {
-            let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if let Ok(ip) = Ipv4Addr::from_str(&response) {
-                let octets = ip.octets();
-                return Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]));
-            }
-        }
-    }
-    
-    None
-}

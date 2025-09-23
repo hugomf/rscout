@@ -14,12 +14,14 @@ path = "src/main.rs"
 tokio = { version = "1.0", features = ["full"] }
 oui = "0.8"
 eui48 = "1.1"
-zeroconf = "0.15"
 async-trait = "0.1"
 comfy-table = "7.2"
 surge-ping = "0.8"
 regex = "1.10"
 futures = "0.3"
+network-interface = "2.0"
+trust-dns-resolver = "0.23"
+arp-toolkit = "0.3.2"
 
 [profile.release]
 opt-level = 3
