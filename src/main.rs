@@ -857,10 +857,10 @@ impl NetworkDiscovery {
             }
         }
         
-        let devices_map = discovered_devices.lock().await;
+       let devices_map = discovered_devices.lock().await;
 
         let mut table = Table::new();
-        table.set_header(vec!["IP", "MAC", "Hostname", "OS", "Type", "Vendor", "Open Ports", "Services"]);
+        table.set_header(vec!["IP", "Hostname", "Vendor", "Type", "OS", "Ports", "Services"]);
         
         for (_, device) in devices_map.iter() {
             let service_details = if device.services.is_empty() {
@@ -868,34 +868,41 @@ impl NetworkDiscovery {
             } else {
                 device.services.iter().map(|s| {
                     if let Some(ref name) = s.service_name {
-                        format!("{}/{}({})", s.port, s.protocol, name)
+                        name.clone()
                     } else {
-                        format!("{}/{}", s.port, s.protocol)
+                        s.port.to_string()
                     }
                 }).collect::<Vec<String>>().join(", ")
             };
-
-            let os_string = format!("{:?}", device.operating_system.clone().unwrap_or(OperatingSystem::Unknown));
-            let banner_string = device.services.iter().find_map(|s| s.banner.as_ref()).cloned().unwrap_or_default();
-            let short_banner = if banner_string.len() > 50 {
-                format!("{}...", &banner_string[..47])
+            
+            let ports_list = if device.open_ports.is_empty() {
+                "—".to_string()
             } else {
-                banner_string.to_string()
+                device.open_ports.iter().map(|p| p.to_string()).collect::<Vec<String>>().join(", ")
             };
-            let os_details = if !short_banner.is_empty() {
-                format!("{} [{}]", os_string, short_banner)
+
+            let os_string = if let Some(ref os) = device.operating_system {
+                match os {
+                    OperatingSystem::Windows(_) => "Windows".to_string(),
+                    OperatingSystem::MacOS(_) => "macOS".to_string(),
+                    OperatingSystem::Linux(Some(name)) => format!("Linux ({})", name),
+                    OperatingSystem::Linux(None) => "Linux".to_string(),
+                    OperatingSystem::IOS(_) => "iOS".to_string(),
+                    OperatingSystem::Android(_) => "Android".to_string(),
+                    OperatingSystem::RouterOS => "RouterOS".to_string(),
+                    _ => "Unknown".to_string(),
+                }
             } else {
-                os_string
+                "Unknown".to_string()
             };
 
             table.add_row(vec![
                 Cell::new(device.ip.to_string()),
-                Cell::new(device.mac.clone().unwrap_or_else(|| "—".to_string())),
                 Cell::new(device.hostname.clone().unwrap_or_else(|| "—".to_string())),
-                Cell::new(os_details),
-                Cell::new(format!("{:?}", device.device_type)),
                 Cell::new(device.vendor.clone().unwrap_or_else(|| "—".to_string())),
-                Cell::new(if device.open_ports.is_empty() { "—".to_string() } else { format!("{:?}", device.open_ports) }),
+                Cell::new(format!("{:?}", device.device_type)),
+                Cell::new(os_string),
+                Cell::new(ports_list),
                 Cell::new(service_details),
             ]);
         }
