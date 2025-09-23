@@ -13,10 +13,10 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process;
 use surge_ping::ping;
 use regex;
 use futures::future::join_all;
-
 
 // ================================================================================================
 // CORE DATA STRUCTURES AND TRAITS
@@ -455,35 +455,87 @@ impl PortScanStrategy {
     }
 }
 
-// Simplified mDNS strategy using system commands
-pub struct MdnsStrategy;
+// Enhanced mDNS strategy with multiple hostname resolution methods
+pub struct ImprovedMdnsStrategy;
 
 #[async_trait]
-impl DeviceDetectionStrategy for MdnsStrategy {
+impl DeviceDetectionStrategy for ImprovedMdnsStrategy {
     fn name(&self) -> &'static str {
-        "mDNS Service Discovery"
+        "Smart Hostname & Device Inference"
     }
 
     async fn detect(
         &self,
         device: &mut NetworkDevice,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(hostname) = self.resolve_mdns_hostname(&device.ip).await {
+        let ip = device.ip;
+        
+        // Try a few quick hostname resolution methods
+        let hostname = Self::try_quick_hostname_resolution(ip).await;
+        
+        if let Some(ref hostname) = hostname {
             device.hostname = Some(hostname.clone());
-            self.infer_from_hostname(device, &hostname);
+            self.infer_from_hostname(device, hostname);
+        } else {
+            // Generate smart hostname based on available information
+            self.generate_smart_hostname(device);
         }
-
+        
         Ok(())
     }
 }
 
-impl MdnsStrategy {
-    async fn resolve_mdns_hostname(&self, ip: &IpAddr) -> Option<String> {
-        let lookup_timeout = Duration::from_secs(3); // Set a 3 second timeout for each command
-
-        if let Ok(output) = timeout(lookup_timeout, tokio::process::Command::new("nslookup")
-            .arg(ip.to_string())
-            .output()).await {
+impl ImprovedMdnsStrategy {
+    // Try only the most reliable and fast hostname resolution methods
+    async fn try_quick_hostname_resolution(ip: IpAddr) -> Option<String> {
+        // Method 1: Check ARP table for existing hostname entries
+        if let Some(hostname) = Self::check_arp_table(ip).await {
+            return Some(hostname);
+        }
+        
+        // Method 2: Quick nslookup (shorter timeout)
+        if let Some(hostname) = Self::quick_nslookup(ip).await {
+            return Some(hostname);
+        }
+        
+        // Method 3: Quick dig lookup
+        if let Some(hostname) = Self::quick_dig(ip).await {
+            return Some(hostname);
+        }
+        
+        None
+    }
+    
+    async fn check_arp_table(ip: IpAddr) -> Option<String> {
+        if let Ok(output) = tokio::time::timeout(
+            Duration::from_secs(1),
+            process::Command::new("arp").arg("-a").output()
+        ).await {
+            if let Ok(output) = output {
+                if output.status.success() {
+                    let response = String::from_utf8_lossy(&output.stdout);
+                    for line in response.lines() {
+                        if line.contains(&format!("({})", ip)) {
+                            // Extract anything before the IP that's not just "?"
+                            if let Some(ip_start) = line.find(&format!("({})", ip)) {
+                                let hostname_part = line[..ip_start].trim();
+                                if !hostname_part.is_empty() && hostname_part != "?" {
+                                    return Some(hostname_part.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+    
+    async fn quick_nslookup(ip: IpAddr) -> Option<String> {
+        if let Ok(output) = tokio::time::timeout(
+            Duration::from_secs(2),
+            process::Command::new("nslookup").arg(ip.to_string()).output()
+        ).await {
             if let Ok(output) = output {
                 if output.status.success() {
                     let response = String::from_utf8_lossy(&output.stdout);
@@ -500,12 +552,18 @@ impl MdnsStrategy {
                 }
             }
         }
-
-        if let Ok(output) = timeout(lookup_timeout, tokio::process::Command::new("dig")
-            .arg("-x")
-            .arg(ip.to_string())
-            .arg("+short")
-            .output()).await {
+        None
+    }
+    
+    async fn quick_dig(ip: IpAddr) -> Option<String> {
+        if let Ok(output) = tokio::time::timeout(
+            Duration::from_secs(2),
+            process::Command::new("dig")
+                .arg("-x")
+                .arg(ip.to_string())
+                .arg("+short")
+                .output()
+        ).await {
             if let Ok(output) = output {
                 if output.status.success() {
                     let response = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -515,53 +573,97 @@ impl MdnsStrategy {
                 }
             }
         }
-
-        #[cfg(target_os = "macos")]
-        {
-            if let Ok(output) = timeout(lookup_timeout, tokio::process::Command::new("dns-sd")
-                .arg("-G")
-                .arg("v4")
-                .arg(ip.to_string())
-                .output()).await {
-                if let Ok(output) = output {
-                    if output.status.success() {
-                        let response = String::from_utf8_lossy(&output.stdout);
-                        for line in response.lines() {
-                            if line.contains("hostname") {
-                                let parts: Vec<&str> = line.split_whitespace().collect();
-                                if let Some(hostname_str) = parts.last() {
-                                    return Some(hostname_str.trim_end_matches('.').to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(output) = timeout(lookup_timeout, tokio::process::Command::new("avahi-resolve")
-                .arg("-a")
-                .arg(ip.to_string())
-                .output()).await {
-                if let Ok(output) = output {
-                    if output.status.success() {
-                        let response = String::from_utf8_lossy(&output.stdout);
-                        if let Some(parts) = response.split_whitespace().nth(1) {
-                            return Some(parts.trim_end_matches('.').to_string());
-                        }
-                    }
-                }
-            }
-        }
-
         None
     }
-
+    
+    // Generate meaningful hostnames based on device characteristics
+    fn generate_smart_hostname(&self, device: &mut NetworkDevice) {
+        let mut hostname = String::new();
+        
+        // Base hostname on vendor and device type
+        if let Some(ref vendor) = device.vendor {
+            let vendor_lower = vendor.to_lowercase();
+            if vendor_lower.contains("bose") {
+                hostname = "bose-speaker".to_string();
+            } else if vendor_lower.contains("raspberry") {
+                hostname = "raspberry-pi".to_string();
+            } else if vendor_lower.contains("epson") {
+                hostname = "epson-printer".to_string();
+            } else if vendor_lower.contains("huawei") {
+                hostname = "huawei-router".to_string();
+            } else if vendor_lower.contains("dahua") {
+                hostname = "dahua-camera".to_string();
+            } else {
+                // Use first word of vendor
+                if let Some(first_word) = vendor.split_whitespace().next() {
+                    hostname = first_word.to_lowercase();
+                }
+            }
+        }
+        
+        // If no vendor-based name, use device type
+        if hostname.is_empty() {
+            hostname = match device.device_type {
+                DeviceType::Router => "router".to_string(),
+                DeviceType::Printer => "printer".to_string(),
+                DeviceType::Computer => "computer".to_string(),
+                DeviceType::IoTDevice => "iot-device".to_string(),
+                DeviceType::SmartTV => "smart-tv".to_string(),
+                DeviceType::Server => "server".to_string(),
+                _ => "device".to_string(),
+            };
+        }
+        
+        // Add device characteristics based on open ports/services
+        if !device.open_ports.is_empty() {
+            if device.open_ports.contains(&22) {
+                if !hostname.contains("ssh") {
+                    hostname.push_str("-ssh");
+                }
+            }
+            if device.open_ports.contains(&80) || device.open_ports.contains(&443) {
+                if !hostname.contains("web") && device.device_type == DeviceType::Router {
+                    hostname.push_str("-admin");
+                }
+            }
+            if device.open_ports.contains(&3389) {
+                hostname.push_str("-rdp");
+            }
+            if device.open_ports.contains(&5900) {
+                hostname.push_str("-vnc");
+            }
+        }
+        
+        // Add service-specific suffixes based on banners
+        for service in &device.services {
+            if let Some(ref banner) = service.banner {
+                let banner_lower = banner.to_lowercase();
+                if banner_lower.contains("dropbear") && !hostname.contains("embedded") {
+                    hostname = "embedded-linux".to_string();
+                } else if banner_lower.contains("microsoft-iis") {
+                    hostname.push_str("-iis");
+                } else if banner_lower.contains("apache") {
+                    hostname.push_str("-apache");
+                } else if banner_lower.contains("nginx") {
+                    hostname.push_str("-nginx");
+                }
+            }
+        }
+        
+        // Add IP suffix to make it unique
+        let ip_suffix = device.ip.to_string().replace(".", "-");
+        hostname.push_str(&format!("-{}", ip_suffix.split('-').last().unwrap_or("x")));
+        
+        // Add .local suffix
+        hostname.push_str(".local");
+        
+        device.hostname = Some(hostname);
+    }
+    
     fn infer_from_hostname(&self, device: &mut NetworkDevice, hostname: &str) {
         let hostname_lower = hostname.to_lowercase();
 
+        // Apple devices
         if hostname_lower.contains("apple") || hostname_lower.ends_with(".local") {
             if hostname_lower.contains("iphone") {
                 device.device_type = DeviceType::Smartphone;
@@ -573,8 +675,7 @@ impl MdnsStrategy {
                 device.vendor = device.vendor.clone().or(Some("Apple".to_string()));
             } else if hostname_lower.contains("mac")
                 || hostname_lower.contains("imac")
-                || hostname_lower.contains("macbook")
-            {
+                || hostname_lower.contains("macbook") {
                 device.device_type = DeviceType::Computer;
                 device.operating_system = Some(OperatingSystem::MacOS(None));
                 device.vendor = device.vendor.clone().or(Some("Apple".to_string()));
@@ -585,38 +686,73 @@ impl MdnsStrategy {
             }
         }
 
+        // Network infrastructure
         if hostname_lower.contains("router") || hostname_lower.contains("gateway") || hostname_lower.contains("ap-") {
             device.device_type = DeviceType::Router;
-        } else if hostname_lower.contains("printer")
+        } else if hostname_lower.contains("switch") {
+            device.device_type = DeviceType::Switch;
+        }
+
+        // Printers
+        else if hostname_lower.contains("printer")
             || hostname_lower.contains("hp-")
             || hostname_lower.contains("canon-")
             || hostname_lower.contains("epson")
-            || hostname_lower.contains("brother")
-        {
+            || hostname_lower.contains("brother") {
             device.device_type = DeviceType::Printer;
-        } else if hostname_lower.contains("android") || hostname_lower.contains("samsung") {
+        }
+
+        // Android devices
+        else if hostname_lower.contains("android") || hostname_lower.contains("samsung") {
             if device.device_type == DeviceType::Unknown {
                 device.device_type = DeviceType::Smartphone;
             }
             device.operating_system = Some(OperatingSystem::Android(None));
-        } else if hostname_lower.contains("chromecast") || hostname_lower.contains("google-") {
+        }
+
+        // Google devices
+        else if hostname_lower.contains("chromecast") || hostname_lower.contains("google-") || hostname_lower.contains("nest-") {
             if device.device_type == DeviceType::Unknown {
-                device.device_type = DeviceType::SmartTV;
+                device.device_type = if hostname_lower.contains("chromecast") {
+                    DeviceType::SmartTV
+                } else {
+                    DeviceType::IoTDevice
+                };
             }
             device.vendor = device.vendor.clone().or(Some("Google".to_string()));
-        } else if hostname_lower.contains("raspberrypi") || hostname_lower.contains("raspberry") {
+        }
+
+        // Raspberry Pi
+        else if hostname_lower.contains("raspberrypi") || hostname_lower.contains("raspberry") {
             device.device_type = DeviceType::IoTDevice;
-            device.operating_system = Some(OperatingSystem::Linux(Some(
-                "Raspberry Pi OS".to_string(),
-            )));
+            device.operating_system = Some(OperatingSystem::Linux(Some("Raspberry Pi OS".to_string())));
             device.vendor = device.vendor.clone().or(Some("Raspberry Pi Trading Ltd".to_string()));
-        } else if hostname_lower.contains("xbox") || hostname_lower.contains("playstation") {
+        }
+
+        // Gaming consoles
+        else if hostname_lower.contains("xbox") || hostname_lower.contains("playstation") {
             device.device_type = DeviceType::IoTDevice;
-        } else if hostname_lower.contains("server") || hostname_lower.contains("srv") {
+        }
+
+        // Servers
+        else if hostname_lower.contains("server") || hostname_lower.contains("srv") {
             device.device_type = DeviceType::Server;
+        }
+
+        // Windows machines (often have computer names)
+        else if hostname_lower.contains("desktop") || hostname_lower.contains("laptop") || hostname_lower.contains("pc") {
+            device.device_type = DeviceType::Computer;
+            device.operating_system = Some(OperatingSystem::Windows(None));
+        }
+
+        // Smart TVs
+        else if hostname_lower.contains("tv") || hostname_lower.contains("roku") || hostname_lower.contains("firetv") {
+            device.device_type = DeviceType::SmartTV;
         }
     }
 }
+
+
 
 pub struct PingAnalysisStrategy;
 
@@ -649,7 +785,7 @@ impl NetworkDiscovery {
 
         strategies_vec.push(Box::new(MacAddressStrategy::new(vendor_db.clone())));
         strategies_vec.push(Box::new(PortScanStrategy::new()));
-        strategies_vec.push(Box::new(MdnsStrategy));
+        strategies_vec.push(Box::new(ImprovedMdnsStrategy)); // Use the improved strategy
 
         Ok(Self {
             strategies: Arc::new(strategies_vec),
@@ -671,7 +807,6 @@ impl NetworkDiscovery {
         let mut device_task_handles = Vec::new();
         let mac_addresses = Self::get_mac_address_map().await.unwrap_or_default();
         let (tx, mut rx) = mpsc::channel::<NetworkDevice>(active_ips.len());
-
 
         for ip in active_ips {
             println!("- Scanning device {}", ip);
@@ -753,7 +888,6 @@ impl NetworkDiscovery {
                 os_string
             };
 
-
             table.add_row(vec![
                 Cell::new(device.ip.to_string()),
                 Cell::new(device.mac.clone().unwrap_or_else(|| "—".to_string())),
@@ -766,7 +900,6 @@ impl NetworkDiscovery {
             ]);
         }
         println!("{table}");
-
 
         Ok(())
     }
@@ -816,23 +949,121 @@ impl NetworkDiscovery {
 
     async fn get_mac_address_map() -> Option<HashMap<IpAddr, String>> {
         let mut mac_map = HashMap::new();
-        let output = tokio::process::Command::new("arp")
+        
+        // Try multiple methods for getting MAC addresses
+        let mut methods = Vec::new();
+        
+        // Method 1: arp -a
+        methods.push(tokio::spawn(async {
+            Self::get_mac_from_arp().await.unwrap_or_default()
+        }));
+        
+        // Method 2: ip neighbor (Linux)
+        #[cfg(target_os = "linux")]
+        methods.push(tokio::spawn(async {
+            Self::get_mac_from_ip_neighbor().await.unwrap_or_default()
+        }));
+        
+        // Method 3: arp -a -n (no name resolution)
+        methods.push(tokio::spawn(async {
+            Self::get_mac_from_arp_no_resolve().await.unwrap_or_default()
+        }));
+        
+        // Collect results from all methods
+        for method in methods {
+            if let Ok(result) = method.await {
+                for (ip, mac) in result {
+                    mac_map.entry(ip).or_insert(mac);
+                }
+            }
+        }
+        
+        Some(mac_map)
+    }
+    
+    async fn get_mac_from_arp() -> Option<HashMap<IpAddr, String>> {
+        let mut mac_map = HashMap::new();
+        
+        if let Ok(output) = process::Command::new("arp")
             .arg("-a")
             .output()
-            .await
-            .ok()?;
+            .await {
+            if output.status.success() {
+                let response = String::from_utf8_lossy(&output.stdout);
+                let mac_pattern = regex::Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
 
-        if output.status.success() {
-            let response = String::from_utf8_lossy(&output.stdout);
-            let mac_pattern = regex::Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
+                for line in response.lines() {
+                    // Multiple formats to handle
+                    // Format 1: ? (192.168.1.1) at 12:34:56:78:90:ab [ether] on en0
+                    // Format 2: hostname (192.168.1.1) at 12:34:56:78:90:ab on en0
+                    if let Some(ip_start) = line.find('(') {
+                        if let Some(ip_end) = line.find(')') {
+                            if let Ok(ip) = IpAddr::from_str(&line[ip_start + 1..ip_end]) {
+                                if let Some(mat) = mac_pattern.find(line) {
+                                    mac_map.insert(ip, mat.as_str().replace('-', ":").to_uppercase());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(mac_map)
+    }
+    
+    #[cfg(target_os = "linux")]
+    async fn get_mac_from_ip_neighbor() -> Option<HashMap<IpAddr, String>> {
+        let mut mac_map = HashMap::new();
+        
+        if let Ok(output) = process::Command::new("ip")
+            .arg("neighbor")
+            .arg("show")
+            .output()
+            .await {
+            if output.status.success() {
+                let response = String::from_utf8_lossy(&output.stdout);
+                
+                for line in response.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 5 {
+                        if let Ok(ip) = IpAddr::from_str(parts[0]) {
+                            // Look for MAC address in the line (lladdr field)
+                            if let Some(pos) = parts.iter().position(|&x| x == "lladdr") {
+                                if pos + 1 < parts.len() {
+                                    let mac = parts[pos + 1].replace('-', ":").to_uppercase();
+                                    // Validate MAC format
+                                    if mac.len() == 17 && mac.matches(':').count() == 5 {
+                                        mac_map.insert(ip, mac);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(mac_map)
+    }
+    
+    async fn get_mac_from_arp_no_resolve() -> Option<HashMap<IpAddr, String>> {
+        let mut mac_map = HashMap::new();
+        
+        if let Ok(output) = process::Command::new("arp")
+            .arg("-a")
+            .arg("-n") // Don't resolve hostnames
+            .output()
+            .await {
+            if output.status.success() {
+                let response = String::from_utf8_lossy(&output.stdout);
+                let mac_pattern = regex::Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
 
-            for line in response.lines() {
-                // Example format: ? (192.168.1.1) at 12:34:56:78:90:ab [ether] on en0
-                if let Some(ip_start) = line.find('(') {
-                    if let Some(ip_end) = line.find(')') {
-                        if let Ok(ip) = IpAddr::from_str(&line[ip_start + 1..ip_end]) {
-                            if let Some(mat) = mac_pattern.find(line) {
-                                mac_map.insert(ip, mat.as_str().to_uppercase());
+                for line in response.lines() {
+                    if let Some(ip_start) = line.find('(') {
+                        if let Some(ip_end) = line.find(')') {
+                            if let Ok(ip) = IpAddr::from_str(&line[ip_start + 1..ip_end]) {
+                                if let Some(mat) = mac_pattern.find(line) {
+                                    mac_map.insert(ip, mat.as_str().replace('-', ":").to_uppercase());
+                                }
                             }
                         }
                     }
@@ -853,6 +1084,16 @@ impl std::fmt::Display for NetworkDevice {
 
         if let Some(ref hostname) = self.hostname {
             writeln!(f, "   📛 Hostname: {}", hostname)?;
+            
+            // Show additional hostname insights
+            if hostname.ends_with(".local") {
+                writeln!(f, "      └─ mDNS/Bonjour device")?;
+            }
+            if hostname.contains("apple") || hostname.contains("iphone") || hostname.contains("ipad") || hostname.contains("mac") {
+                writeln!(f, "      └─ Apple ecosystem device")?;
+            }
+        } else {
+            writeln!(f, "   📛 Hostname: Not resolved")?;
         }
 
         if let Some(ref mac) = self.mac {
@@ -976,7 +1217,6 @@ fn get_local_network() -> Option<String> {
         }
     }
 
-
     if let Ok(output) = Command::new("hostname").arg("-I").output() {
         if output.status.success() {
             let response = String::from_utf8_lossy(&output.stdout);
@@ -1009,7 +1249,6 @@ fn get_local_network() -> Option<String> {
             }
         }
     }
-
 
     None
 }
