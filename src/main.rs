@@ -1,22 +1,22 @@
 use async_trait::async_trait;
 use comfy_table::{Cell, Table};
 use eui48::MacAddress;
+use futures::future::join_all;
 use oui::OuiDatabase;
+use regex::Regex;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use surge_ping::ping;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::process;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process;
-use surge_ping::ping;
-use regex;
-use futures::future::join_all;
 
 // ================================================================================================
 // CORE DATA STRUCTURES AND TRAITS
@@ -95,18 +95,18 @@ pub struct MacVendorDatabase {
 impl MacVendorDatabase {
     pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         println!("📋 Loading OUI database...");
-        // include_bytes! expects path relative to CARGO_MANIFEST_DIR (project root)
         let file_path = "manuf.txt";
+        
         let oui_db = match OuiDatabase::new_from_file(file_path) {
             Ok(db) => db,
             Err(e) => {
-                eprintln!("⚠️ Failed to load {}  from project root: {}", file_path, e);
+                eprintln!("⚠️ Failed to load {} from project root: {}", file_path, e);
                 println!("⚠️ Using fallback OUI database (this will result in missing vendor info)");
-                OuiDatabase::new_from_str("")? // Fallback to an empty database
+                OuiDatabase::new_from_str("")?
             }
         };
+        
         println!("✅ OUI database loaded successfully");
-
         Ok(Self {
             oui_db,
             vendor_cache: HashMap::new(),
@@ -115,11 +115,10 @@ impl MacVendorDatabase {
 
     pub fn lookup_vendor(&mut self, mac: &str) -> Option<String> {
         let clean_mac = self.normalize_mac(mac)?;
-
         if let Some(vendor) = self.vendor_cache.get(&clean_mac) {
             return Some(vendor.clone());
         }
-
+        
         if let Ok(mac_addr) = MacAddress::parse_str(&clean_mac) {
             if let Ok(Some(entry)) = self.oui_db.query_by_mac(&mac_addr) {
                 let vendor = entry.name_long.clone().unwrap_or_default();
@@ -135,7 +134,6 @@ impl MacVendorDatabase {
 
     pub fn get_device_info(&mut self, mac: &str) -> Option<DeviceInfo> {
         let vendor = self.lookup_vendor(mac)?;
-
         Some(DeviceInfo {
             vendor: vendor.clone(),
             device_type: self.infer_device_type(&vendor),
@@ -145,8 +143,8 @@ impl MacVendorDatabase {
 
     fn normalize_mac(&self, mac: &str) -> Option<String> {
         let cleaned = mac.replace("-", ":").replace(".", ":").to_uppercase();
-
         let parts: Vec<&str> = cleaned.split(':').collect();
+        
         if parts.len() == 6 && parts.iter().all(|p| p.len() == 2) {
             Some(cleaned)
         } else if cleaned.len() == 12 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -165,7 +163,6 @@ impl MacVendorDatabase {
 
     fn infer_device_type(&self, vendor: &str) -> DeviceType {
         let vendor_lower = vendor.to_lowercase();
-
         match vendor_lower.as_str() {
             v if v.contains("apple") => DeviceType::AppleDevice,
             v if v.contains("samsung") && (v.contains("electronics") || v.contains("mobile")) => {
@@ -211,7 +208,6 @@ impl MacVendorDatabase {
 
     fn infer_operating_system(&self, vendor: &str) -> Option<OperatingSystem> {
         let vendor_lower = vendor.to_lowercase();
-
         match vendor_lower.as_str() {
             v if v.contains("apple") => Some(OperatingSystem::MacOS(None)),
             v if v.contains("microsoft") => Some(OperatingSystem::Windows(None)),
@@ -264,7 +260,7 @@ impl DeviceDetectionStrategy for MacAddressStrategy {
                 let mut db = self.vendor_db.lock().await;
                 db.get_device_info(mac)
             };
-
+            
             if let Some(info) = device_info {
                 device.vendor = Some(info.vendor);
                 if device.device_type == DeviceType::Unknown {
@@ -309,7 +305,7 @@ impl DeviceDetectionStrategy for PortScanStrategy {
         for &port in &self.common_ports {
             let handle = tokio::spawn(async move {
                 let mut open_port_info: Option<(u16, NetworkService)> = None;
-
+                
                 if let Ok(connect_result) = timeout(Duration::from_millis(300), TcpStream::connect((ip, port))).await {
                     if let Ok(mut stream) = connect_result {
                         let mut service = NetworkService {
@@ -322,6 +318,8 @@ impl DeviceDetectionStrategy for PortScanStrategy {
                         };
 
                         let mut buf = vec![0; 1024];
+                        
+                        // Send HTTP HEAD request for web ports
                         if port == 80 || port == 443 || port == 8080 || port == 8443 {
                             let request = b"HEAD / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n";
                             let _ = timeout(Duration::from_millis(300), stream.write_all(request)).await;
@@ -342,6 +340,7 @@ impl DeviceDetectionStrategy for PortScanStrategy {
                                 }
                             }
                         }
+                        
                         open_port_info = Some((port, service));
                     }
                 }
@@ -351,58 +350,64 @@ impl DeviceDetectionStrategy for PortScanStrategy {
         }
 
         let results = join_all(port_handles).await;
-
         for result in results {
             if let Ok(Some((port, service))) = result {
                 device.open_ports.push(port);
-                device.open_ports.sort();
-                device.open_ports.dedup();
                 device.services.push(service);
             }
         }
-        
+
+        // Remove duplicates and sort
+        device.open_ports.sort();
+        device.open_ports.dedup();
+
         // Final inference pass after all ports have been scanned
         let mut has_web_server = false;
         let mut has_windows_service = false;
         let mut has_ssh = false;
 
         for service in &device.services {
-            if service.port == 80 || service.port == 443 || service.port == 8080 || service.port == 8443 {
-                has_web_server = true;
-                if let Some(ref banner) = service.banner {
-                    let lower_banner = banner.to_lowercase();
-                    if lower_banner.contains("apache") || lower_banner.contains("nginx") {
-                        if device.operating_system.is_none() {
+            match service.port {
+                80 | 443 | 8080 | 8443 => {
+                    has_web_server = true;
+                    if let Some(ref banner) = service.banner {
+                        let lower_banner = banner.to_lowercase();
+                        if lower_banner.contains("apache") || lower_banner.contains("nginx") {
+                            if device.operating_system.is_none() {
+                                device.operating_system = Some(OperatingSystem::Linux(None));
+                            }
+                            if device.device_type == DeviceType::Unknown {
+                                device.device_type = DeviceType::Server;
+                            }
+                        } else if lower_banner.contains("microsoft-iis") {
+                            if device.operating_system.is_none() {
+                                device.operating_system = Some(OperatingSystem::Windows(None));
+                            }
+                            if device.device_type == DeviceType::Unknown {
+                                device.device_type = DeviceType::Server;
+                            }
+                        } else if lower_banner.contains("router") || lower_banner.contains("admin page") {
+                            if device.device_type == DeviceType::Unknown {
+                                device.device_type = DeviceType::Router;
+                            }
+                        }
+                    }
+                }
+                22 => {
+                    has_ssh = true;
+                    if let Some(ref banner) = service.banner {
+                        let lower_banner = banner.to_lowercase();
+                        if lower_banner.contains("debian") || lower_banner.contains("ubuntu") {
+                            device.operating_system = Some(OperatingSystem::Linux(Some("Debian/Ubuntu".to_string())));
+                        } else if lower_banner.contains("openssh") {
                             device.operating_system = Some(OperatingSystem::Linux(None));
                         }
-                        if device.device_type == DeviceType::Unknown {
-                            device.device_type = DeviceType::Server;
-                        }
-                    } else if lower_banner.contains("microsoft-iis") {
-                        if device.operating_system.is_none() {
-                            device.operating_system = Some(OperatingSystem::Windows(None));
-                        }
-                        if device.device_type == DeviceType::Unknown {
-                            device.device_type = DeviceType::Server;
-                        }
-                    } else if lower_banner.contains("router") || lower_banner.contains("admin page") {
-                        if device.device_type == DeviceType::Unknown {
-                            device.device_type = DeviceType::Router;
-                        }
                     }
                 }
-            } else if service.port == 22 {
-                has_ssh = true;
-                if let Some(ref banner) = service.banner {
-                    let lower_banner = banner.to_lowercase();
-                    if lower_banner.contains("debian") || lower_banner.contains("ubuntu") {
-                        device.operating_system = Some(OperatingSystem::Linux(Some("Debian/Ubuntu".to_string())));
-                    } else if lower_banner.contains("openssh") {
-                        device.operating_system = Some(OperatingSystem::Linux(None));
-                    }
+                135 | 139 | 445 | 3389 => {
+                    has_windows_service = true;
                 }
-            } else if service.port == 135 || service.port == 139 || service.port == 445 || service.port == 3389 {
-                has_windows_service = true;
+                _ => {}
             }
         }
 
@@ -414,6 +419,7 @@ impl DeviceDetectionStrategy for PortScanStrategy {
                 device.operating_system = Some(OperatingSystem::Linux(None));
             }
         }
+
         if device.device_type == DeviceType::Unknown {
             if has_windows_service || has_ssh {
                 device.device_type = DeviceType::Computer;
@@ -505,7 +511,7 @@ impl ImprovedMdnsStrategy {
         
         None
     }
-    
+
     async fn check_arp_table(ip: IpAddr) -> Option<String> {
         if let Ok(output) = tokio::time::timeout(
             Duration::from_secs(1),
@@ -530,7 +536,7 @@ impl ImprovedMdnsStrategy {
         }
         None
     }
-    
+
     async fn quick_nslookup(ip: IpAddr) -> Option<String> {
         if let Ok(output) = tokio::time::timeout(
             Duration::from_secs(2),
@@ -554,7 +560,7 @@ impl ImprovedMdnsStrategy {
         }
         None
     }
-    
+
     async fn quick_dig(ip: IpAddr) -> Option<String> {
         if let Ok(output) = tokio::time::timeout(
             Duration::from_secs(2),
@@ -575,7 +581,7 @@ impl ImprovedMdnsStrategy {
         }
         None
     }
-    
+
     // Generate meaningful hostnames based on device characteristics
     fn generate_smart_hostname(&self, device: &mut NetworkDevice) {
         let mut hostname = String::new();
@@ -616,19 +622,19 @@ impl ImprovedMdnsStrategy {
         
         // Add device characteristics based on open ports/services
         if !device.open_ports.is_empty() {
-            if device.open_ports.contains(&22) {
-                if !hostname.contains("ssh") {
-                    hostname.push_str("-ssh");
-                }
+            if device.open_ports.contains(&22) && !hostname.contains("ssh") {
+                hostname.push_str("-ssh");
             }
-            if device.open_ports.contains(&80) || device.open_ports.contains(&443) {
-                if !hostname.contains("web") && device.device_type == DeviceType::Router {
-                    hostname.push_str("-admin");
-                }
+            
+            if (device.open_ports.contains(&80) || device.open_ports.contains(&443)) && 
+               device.device_type == DeviceType::Router && !hostname.contains("web") {
+                hostname.push_str("-admin");
             }
+            
             if device.open_ports.contains(&3389) {
                 hostname.push_str("-rdp");
             }
+            
             if device.open_ports.contains(&5900) {
                 hostname.push_str("-vnc");
             }
@@ -656,13 +662,12 @@ impl ImprovedMdnsStrategy {
         
         // Add .local suffix
         hostname.push_str(".local");
-        
         device.hostname = Some(hostname);
     }
-    
+
     fn infer_from_hostname(&self, device: &mut NetworkDevice, hostname: &str) {
         let hostname_lower = hostname.to_lowercase();
-
+        
         // Apple devices
         if hostname_lower.contains("apple") || hostname_lower.ends_with(".local") {
             if hostname_lower.contains("iphone") {
@@ -673,9 +678,7 @@ impl ImprovedMdnsStrategy {
                 device.device_type = DeviceType::Tablet;
                 device.operating_system = Some(OperatingSystem::IOS(None));
                 device.vendor = device.vendor.clone().or(Some("Apple".to_string()));
-            } else if hostname_lower.contains("mac")
-                || hostname_lower.contains("imac")
-                || hostname_lower.contains("macbook") {
+            } else if hostname_lower.contains("mac") || hostname_lower.contains("imac") || hostname_lower.contains("macbook") {
                 device.device_type = DeviceType::Computer;
                 device.operating_system = Some(OperatingSystem::MacOS(None));
                 device.vendor = device.vendor.clone().or(Some("Apple".to_string()));
@@ -685,23 +688,21 @@ impl ImprovedMdnsStrategy {
                 device.vendor = device.vendor.clone().or(Some("Apple".to_string()));
             }
         }
-
+        
         // Network infrastructure
         if hostname_lower.contains("router") || hostname_lower.contains("gateway") || hostname_lower.contains("ap-") {
             device.device_type = DeviceType::Router;
         } else if hostname_lower.contains("switch") {
             device.device_type = DeviceType::Switch;
         }
-
+        
         // Printers
-        else if hostname_lower.contains("printer")
-            || hostname_lower.contains("hp-")
-            || hostname_lower.contains("canon-")
-            || hostname_lower.contains("epson")
-            || hostname_lower.contains("brother") {
+        else if hostname_lower.contains("printer") || hostname_lower.contains("hp-") || 
+                hostname_lower.contains("canon-") || hostname_lower.contains("epson") || 
+                hostname_lower.contains("brother") {
             device.device_type = DeviceType::Printer;
         }
-
+        
         // Android devices
         else if hostname_lower.contains("android") || hostname_lower.contains("samsung") {
             if device.device_type == DeviceType::Unknown {
@@ -709,7 +710,7 @@ impl ImprovedMdnsStrategy {
             }
             device.operating_system = Some(OperatingSystem::Android(None));
         }
-
+        
         // Google devices
         else if hostname_lower.contains("chromecast") || hostname_lower.contains("google-") || hostname_lower.contains("nest-") {
             if device.device_type == DeviceType::Unknown {
@@ -721,38 +722,36 @@ impl ImprovedMdnsStrategy {
             }
             device.vendor = device.vendor.clone().or(Some("Google".to_string()));
         }
-
+        
         // Raspberry Pi
         else if hostname_lower.contains("raspberrypi") || hostname_lower.contains("raspberry") {
             device.device_type = DeviceType::IoTDevice;
             device.operating_system = Some(OperatingSystem::Linux(Some("Raspberry Pi OS".to_string())));
             device.vendor = device.vendor.clone().or(Some("Raspberry Pi Trading Ltd".to_string()));
         }
-
+        
         // Gaming consoles
         else if hostname_lower.contains("xbox") || hostname_lower.contains("playstation") {
             device.device_type = DeviceType::IoTDevice;
         }
-
+        
         // Servers
         else if hostname_lower.contains("server") || hostname_lower.contains("srv") {
             device.device_type = DeviceType::Server;
         }
-
+        
         // Windows machines (often have computer names)
         else if hostname_lower.contains("desktop") || hostname_lower.contains("laptop") || hostname_lower.contains("pc") {
             device.device_type = DeviceType::Computer;
             device.operating_system = Some(OperatingSystem::Windows(None));
         }
-
+        
         // Smart TVs
         else if hostname_lower.contains("tv") || hostname_lower.contains("roku") || hostname_lower.contains("firetv") {
             device.device_type = DeviceType::SmartTV;
         }
     }
 }
-
-
 
 pub struct PingAnalysisStrategy;
 
@@ -782,28 +781,29 @@ impl NetworkDiscovery {
     pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let vendor_db = Arc::new(Mutex::new(MacVendorDatabase::new()?));
         let mut strategies_vec: Vec<Box<dyn DeviceDetectionStrategy>> = Vec::new();
-
+        
         strategies_vec.push(Box::new(MacAddressStrategy::new(vendor_db.clone())));
         strategies_vec.push(Box::new(PortScanStrategy::new()));
-        strategies_vec.push(Box::new(ImprovedMdnsStrategy)); // Use the improved strategy
-
+        strategies_vec.push(Box::new(ImprovedMdnsStrategy));
+        
         Ok(Self {
             strategies: Arc::new(strategies_vec),
         })
     }
 
-    pub fn add_strategy(&mut self, _strategy: Box<dyn DeviceDetectionStrategy>) {}
+    pub fn add_strategy(&mut self, _strategy: Box<dyn DeviceDetectionStrategy>) {
+        // Implementation for future expansion
+    }
 
     pub async fn discover_network_stream(
         &self,
         network: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let active_ips = self.ping_sweep(network).await?;
-        println!("📍 Found {} active devices\n", active_ips.len());
+        println!("📍 Found {} active devices", active_ips.len());
         
         // This HashMap will store the most up-to-date info for each device
         let discovered_devices = Arc::new(Mutex::new(HashMap::<IpAddr, NetworkDevice>::new()));
-
         let mut device_task_handles = Vec::new();
         let mac_addresses = Self::get_mac_address_map().await.unwrap_or_default();
         let (tx, mut rx) = mpsc::channel::<NetworkDevice>(active_ips.len());
@@ -813,7 +813,7 @@ impl NetworkDiscovery {
             let strategies = self.strategies.clone();
             let tx_clone = tx.clone();
             let mac_addresses = mac_addresses.clone();
-
+            
             device_task_handles.push(tokio::spawn(async move {
                 let mut device = NetworkDevice {
                     ip,
@@ -827,27 +827,39 @@ impl NetworkDiscovery {
                     response_time: None,
                     last_seen: std::time::SystemTime::now(),
                 };
-
+                
                 for strategy in strategies.iter() {
                     let _ = strategy.detect(&mut device).await;
                 }
                 
-                let _ = tx_clone.send(device.clone()).await; 
+                let _ = tx_clone.send(device).await; 
             }));
         }
-
+        
         drop(tx); 
 
         // Wait for all tasks to complete and collect all results
         while let Some(mut device) = rx.recv().await {
             let mut devices_map = discovered_devices.lock().await;
-
             if let Some(existing_device) = devices_map.get_mut(&device.ip) {
-                if existing_device.mac.is_none() { existing_device.mac = device.mac.take(); }
-                if existing_device.hostname.is_none() { existing_device.hostname = device.hostname.take(); }
-                if existing_device.vendor.is_none() { existing_device.vendor = device.vendor.take(); }
-                if existing_device.device_type == DeviceType::Unknown && device.device_type != DeviceType::Unknown { existing_device.device_type = device.device_type; }
-                if existing_device.operating_system.is_none() { existing_device.operating_system = device.operating_system.take(); }
+                // Update fields only if they're not already set
+                if existing_device.mac.is_none() { 
+                    existing_device.mac = device.mac.take(); 
+                }
+                if existing_device.hostname.is_none() { 
+                    existing_device.hostname = device.hostname.take(); 
+                }
+                if existing_device.vendor.is_none() { 
+                    existing_device.vendor = device.vendor.take(); 
+                }
+                if existing_device.device_type == DeviceType::Unknown && device.device_type != DeviceType::Unknown { 
+                    existing_device.device_type = device.device_type; 
+                }
+                if existing_device.operating_system.is_none() { 
+                    existing_device.operating_system = device.operating_system.take(); 
+                }
+                
+                // Merge ports and services
                 existing_device.open_ports.extend(device.open_ports.iter().cloned());
                 existing_device.open_ports.sort();
                 existing_device.open_ports.dedup();
@@ -856,9 +868,9 @@ impl NetworkDiscovery {
                 devices_map.insert(device.ip, device);
             }
         }
-        
-       let devices_map = discovered_devices.lock().await;
 
+        // Display results
+        let devices_map = discovered_devices.lock().await;
         let mut table = Table::new();
         table.set_header(vec!["IP", "Hostname", "Vendor", "Type", "OS", "Ports", "Services"]);
         
@@ -880,7 +892,7 @@ impl NetworkDiscovery {
             } else {
                 device.open_ports.iter().map(|p| p.to_string()).collect::<Vec<String>>().join(", ")
             };
-
+            
             let os_string = if let Some(ref os) = device.operating_system {
                 match os {
                     OperatingSystem::Windows(_) => "Windows".to_string(),
@@ -895,7 +907,7 @@ impl NetworkDiscovery {
             } else {
                 "Unknown".to_string()
             };
-
+            
             table.add_row(vec![
                 Cell::new(device.ip.to_string()),
                 Cell::new(device.hostname.clone().unwrap_or_else(|| "—".to_string())),
@@ -906,44 +918,41 @@ impl NetworkDiscovery {
                 Cell::new(service_details),
             ]);
         }
-        println!("{table}");
-
+        
+        println!("{}", table);
         Ok(())
     }
 
     async fn ping_sweep(&self, network: &str) -> Result<Vec<IpAddr>, Box<dyn std::error::Error + Send + Sync>> {
         let mut active_ips = Vec::new();
-
+        
         if let Some(base) = network.strip_suffix("/24") {
             let base_parts: Vec<&str> = base.split('.').collect();
             if base_parts.len() == 4 {
                 let base_ip_str = format!("{}.{}.{}.", base_parts[0], base_parts[1], base_parts[2]);
-
                 let mut handles = Vec::new();
-
+                
                 for i in 1..255 {
                     let ip_str = format!("{}{}", base_ip_str, i);
                     if let Ok(ip) = Ipv4Addr::from_str(&ip_str) {
                         let target_ip: IpAddr = ip.into();
-                        
                         let handle = tokio::spawn(async move {
                             let payload = [0; 56];
-                            
                             match timeout(Duration::from_millis(500), ping(target_ip, &payload)).await {
                                 Ok(Ok((_icmp_packet, _duration))) => {
-                                    return Some(target_ip);
+                                    Some(target_ip)
                                 },
                                 Ok(Err(e)) => {
                                     eprintln!("Ping error for {}: {}", target_ip, e);
+                                    None
                                 },
-                                Err(_) => {},
+                                Err(_) => None,
                             }
-                            None
                         });
                         handles.push(handle);
                     }
                 }
-
+                
                 for handle in handles {
                     if let Ok(Some(ip)) = handle.await {
                         active_ips.push(ip);
@@ -951,6 +960,7 @@ impl NetworkDiscovery {
                 }
             }
         }
+        
         Ok(active_ips)
     }
 
@@ -987,7 +997,7 @@ impl NetworkDiscovery {
         
         Some(mac_map)
     }
-    
+
     async fn get_mac_from_arp() -> Option<HashMap<IpAddr, String>> {
         let mut mac_map = HashMap::new();
         
@@ -997,8 +1007,8 @@ impl NetworkDiscovery {
             .await {
             if output.status.success() {
                 let response = String::from_utf8_lossy(&output.stdout);
-                let mac_pattern = regex::Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
-
+                let mac_pattern = Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
+                
                 for line in response.lines() {
                     // Multiple formats to handle
                     // Format 1: ? (192.168.1.1) at 12:34:56:78:90:ab [ether] on en0
@@ -1015,9 +1025,10 @@ impl NetworkDiscovery {
                 }
             }
         }
+        
         Some(mac_map)
     }
-    
+
     #[cfg(target_os = "linux")]
     async fn get_mac_from_ip_neighbor() -> Option<HashMap<IpAddr, String>> {
         let mut mac_map = HashMap::new();
@@ -1029,7 +1040,6 @@ impl NetworkDiscovery {
             .await {
             if output.status.success() {
                 let response = String::from_utf8_lossy(&output.stdout);
-                
                 for line in response.lines() {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 5 {
@@ -1049,9 +1059,10 @@ impl NetworkDiscovery {
                 }
             }
         }
+        
         Some(mac_map)
     }
-    
+
     async fn get_mac_from_arp_no_resolve() -> Option<HashMap<IpAddr, String>> {
         let mut mac_map = HashMap::new();
         
@@ -1062,8 +1073,8 @@ impl NetworkDiscovery {
             .await {
             if output.status.success() {
                 let response = String::from_utf8_lossy(&output.stdout);
-                let mac_pattern = regex::Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
-
+                let mac_pattern = Regex::new(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})").unwrap();
+                
                 for line in response.lines() {
                     if let Some(ip_start) = line.find('(') {
                         if let Some(ip_end) = line.find(')') {
@@ -1077,6 +1088,7 @@ impl NetworkDiscovery {
                 }
             }
         }
+        
         Some(mac_map)
     }
 }
@@ -1088,10 +1100,8 @@ impl NetworkDiscovery {
 impl std::fmt::Display for NetworkDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "🖥️  Device: {}", self.ip)?;
-
         if let Some(ref hostname) = self.hostname {
             writeln!(f, "   📛 Hostname: {}", hostname)?;
-            
             // Show additional hostname insights
             if hostname.ends_with(".local") {
                 writeln!(f, "      └─ mDNS/Bonjour device")?;
@@ -1102,29 +1112,22 @@ impl std::fmt::Display for NetworkDevice {
         } else {
             writeln!(f, "   📛 Hostname: Not resolved")?;
         }
-
         if let Some(ref mac) = self.mac {
             writeln!(f, "   🔗 MAC: {}", mac)?;
         }
-
         if let Some(ref vendor) = self.vendor {
             writeln!(f, "   🏢 Vendor: {}", vendor)?;
         }
-
         writeln!(f, "   📱 Type: {:?}", self.device_type)?;
-
         if let Some(ref os) = self.operating_system {
             writeln!(f, "   💻 OS: {:?}", os)?;
         }
-
         if !self.open_ports.is_empty() {
             writeln!(f, "   🔓 Open Ports: {:?}", self.open_ports)?;
         }
-
         if let Some(response_time) = self.response_time {
             writeln!(f, "   ⚡ Response Time: {:?}", response_time)?;
         }
-
         if !self.services.is_empty() {
             writeln!(f, "   🛠️  Services:")?;
             for service in &self.services {
@@ -1146,7 +1149,6 @@ impl std::fmt::Display for NetworkDevice {
                 writeln!(f, "{}", service_line)?;
             }
         }
-
         writeln!(f, "")
     }
 }
@@ -1158,20 +1160,21 @@ impl std::fmt::Display for NetworkDevice {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("🌐 Network Discovery Tool - Rust Implementation");
-    println!("================================================\n");
-
+    println!("================================================");
+    
     let args: Vec<String> = std::env::args().collect();
     let network = if args.len() > 1 {
         args[1].clone()
     } else {
         get_local_network().unwrap_or_else(|| "192.168.1.0/24".to_string())
     };
-
-    println!("🔍 Target network: {}\n", network);
-
+    
+    println!("🔍 Target network: {}", network);
+    println!(); // Add spacing
+    
     let discovery = NetworkDiscovery::new()?;
     discovery.discover_network_stream(&network).await?;
-
+    
     Ok(())
 }
 
@@ -1201,7 +1204,7 @@ fn get_local_network() -> Option<String> {
             }
         }
     }
-
+    
     #[cfg(target_os = "macos")]
     if let Ok(output) = Command::new("netstat")
         .arg("-rn")
@@ -1223,7 +1226,7 @@ fn get_local_network() -> Option<String> {
             }
         }
     }
-
+    
     if let Ok(output) = Command::new("hostname").arg("-I").output() {
         if output.status.success() {
             let response = String::from_utf8_lossy(&output.stdout);
@@ -1241,7 +1244,7 @@ fn get_local_network() -> Option<String> {
             }
         }
     }
-
+    
     #[cfg(target_os = "macos")]
     if let Ok(output) = Command::new("ipconfig")
         .arg("getifaddr")
@@ -1256,6 +1259,6 @@ fn get_local_network() -> Option<String> {
             }
         }
     }
-
+    
     None
 }
