@@ -1,7 +1,8 @@
+// Note: `libarp` is the public API module of the `arp-toolkit` crate.
 use async_trait::async_trait;
 use comfy_table::{Cell, Table};
 use eui48::MacAddress;
-use futures::future::join_all;
+use futures::pin_mut;
 use futures::stream::{self, StreamExt};
 use oui::OuiDatabase;
 use std::collections::HashMap;
@@ -18,10 +19,134 @@ use trust_dns_resolver::TokioAsyncResolver;
 use libarp::client::ArpClient;
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 
+// Embed manuf.txt at compile time
+const MANUF_DATA: &str = include_str!("../manuf.txt");
+
+// Built-in OUI fallback for basic vendor detection
+const BUILTIN_OUI: &str = r#"
+00:00:5E   IANA
+00:17:F2   Apple, Inc.
+00:1C:B3   Apple, Inc.
+00:26:BB   Apple, Inc.
+00:1A:11   Samsung Electronics Co.,Ltd
+D8:27:27   Samsung Electronics Co.,Ltd
+B8:27:EB   Raspberry Pi Foundation
+00:0C:29   VMware, Inc.
+00:50:56   VMware, Inc.
+00:0F:FE   Intel Corporate
+00:18:8B   Microsoft Corporation
+00:22:48   Microsoft Corporation
+00:0D:3A   Microsoft Corporation
+00:15:5D   Microsoft Corporation
+00:00:0C   Cisco Systems, Inc
+00:01:42   Cisco Systems, Inc
+00:01:43   Cisco Systems, Inc
+00:01:63   Cisco Systems, Inc
+00:01:64   Cisco Systems, Inc
+00:01:96   Cisco Systems, Inc
+00:01:97   Cisco Systems, Inc
+00:02:16   Cisco Systems, Inc
+00:02:17   Cisco Systems, Inc
+00:02:4A   Cisco Systems, Inc
+00:02:4B   Cisco Systems, Inc
+00:02:FD   Cisco Systems, Inc
+00:03:32   Cisco Systems, Inc
+00:03:6F   Cisco Systems, Inc
+00:03:E3   Cisco Systems, Inc
+00:04:27   Cisco Systems, Inc
+00:04:9A   Cisco Systems, Inc
+00:04:C1   Cisco Systems, Inc
+00:05:5E   Cisco Systems, Inc
+00:05:AC   Cisco Systems, Inc
+00:06:28   Cisco Systems, Inc
+00:06:5B   Cisco Systems, Inc
+00:07:0E   Cisco Systems, Inc
+00:07:4F   Cisco Systems, Inc
+00:07:7D   Cisco Systems, Inc
+00:07:EA   Cisco Systems, Inc
+00:08:2F   Cisco Systems, Inc
+00:08:74   Cisco Systems, Inc
+00:08:E3   Cisco Systems, Inc
+00:09:11   Cisco Systems, Inc
+00:09:7C   Cisco Systems, Inc
+00:0A:41   Cisco Systems, Inc
+00:0A:DC   Cisco Systems, Inc
+00:0B:5F   Cisco Systems, Inc
+00:0B:BE   Cisco Systems, Inc
+00:0C:30   Cisco Systems, Inc
+00:0C:85   Cisco Systems, Inc
+00:0D:28   Cisco Systems, Inc
+00:0D:BD   Cisco Systems, Inc
+00:0E:35   Cisco Systems, Inc
+00:0E:8C   Cisco Systems, Inc
+00:0F:34   Cisco Systems, Inc
+00:0F:8F   Cisco Systems, Inc
+00:10:07   Cisco Systems, Inc
+00:10:2F   Cisco Systems, Inc
+00:10:7B   Cisco Systems, Inc
+00:10:C6   Cisco Systems, Inc
+00:11:20   Cisco Systems, Inc
+00:11:92   Cisco Systems, Inc
+00:11:9B   Cisco Systems, Inc
+00:12:00   Cisco Systems, Inc
+00:12:43   Cisco Systems, Inc
+00:12:80   Cisco Systems, Inc
+00:12:D9   Cisco Systems, Inc
+00:13:1A   Cisco Systems, Inc
+00:13:5F   Cisco Systems, Inc
+00:13:C3   Cisco Systems, Inc
+00:14:1C   Cisco Systems, Inc
+00:14:A8   Cisco Systems, Inc
+00:14:F2   Cisco Systems, Inc
+00:15:2B   Cisco Systems, Inc
+00:15:60   Cisco Systems, Inc
+00:15:96   Cisco Systems, Inc
+00:16:41   Cisco Systems, Inc
+00:16:C7   Cisco Systems, Inc
+00:17:59   Cisco Systems, Inc
+00:17:95   Cisco Systems, Inc
+00:17:D3   Cisco Systems, Inc
+00:18:74   Cisco Systems, Inc
+00:18:B9   Cisco Systems, Inc
+00:19:30   Cisco Systems, Inc
+00:19:AA   Cisco Systems, Inc
+00:1A:2F   Cisco Systems, Inc
+00:1A:64   Cisco Systems, Inc
+00:1A:A2   Cisco Systems, Inc
+00:1B:0C   Cisco Systems, Inc
+00:1B:54   Cisco Systems, Inc
+00:1B:D5   Cisco Systems, Inc
+00:1C:58   Cisco Systems, Inc
+00:1C:DF   Cisco Systems, Inc
+00:1D:45   Cisco Systems, Inc
+00:1D:A2   Cisco Systems, Inc
+00:1E:13   Cisco Systems, Inc
+00:1E:49   Cisco Systems, Inc
+00:1E:B7   Cisco Systems, Inc
+00:1F:6C   Cisco Systems, Inc
+00:1F:90   Cisco Systems, Inc
+00:1F:CA   Cisco Systems, Inc
+00:21:1B   Cisco Systems, Inc
+00:21:55   Cisco Systems, Inc
+00:21:56   Cisco Systems, Inc
+00:22:55   Cisco Systems, Inc
+00:22:90   Cisco Systems, Inc
+00:23:33   Cisco Systems, Inc
+00:23:AB   Cisco Systems, Inc
+00:24:10   Cisco Systems, Inc
+00:24:50   Cisco Systems, Inc
+00:24:97   Cisco Systems, Inc
+00:25:45   Cisco Systems, Inc
+00:25:83   Cisco Systems, Inc
+00:26:52   Cisco Systems, Inc
+00:26:CB   Cisco Systems, Inc
+00:27:0D   Cisco Systems, Inc
+00:27:10   Cisco Systems, Inc
+"#;
+
 // ================================================================================================
 // ENHANCED CONFIGURATION
 // ================================================================================================
-
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
     pub common_ports: Vec<u16>,
@@ -31,7 +156,6 @@ pub struct ScanConfig {
     pub max_concurrent_scans: usize,
     pub enable_advanced_fingerprinting: bool,
 }
-
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
@@ -51,7 +175,6 @@ impl Default for ScanConfig {
 // ================================================================================================
 // ENHANCED ERROR HANDLING
 // ================================================================================================
-
 #[derive(Debug)]
 pub enum NetworkDiscoveryError {
     OuiDatabaseError(String),
@@ -63,7 +186,6 @@ pub enum NetworkDiscoveryError {
     FingerprintError(String),
     Other(String),
 }
-
 impl std::fmt::Display for NetworkDiscoveryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -78,21 +200,17 @@ impl std::fmt::Display for NetworkDiscoveryError {
         }
     }
 }
-
 impl std::error::Error for NetworkDiscoveryError {}
-
 impl From<std::io::Error> for NetworkDiscoveryError {
     fn from(error: std::io::Error) -> Self {
         NetworkDiscoveryError::IoError(error)
     }
 }
-
 impl From<String> for NetworkDiscoveryError {
     fn from(error: String) -> Self {
         NetworkDiscoveryError::Other(error)
     }
 }
-
 impl From<network_interface::Error> for NetworkDiscoveryError {
     fn from(error: network_interface::Error) -> Self {
         NetworkDiscoveryError::NetworkInterfaceError(error.to_string())
@@ -102,7 +220,6 @@ impl From<network_interface::Error> for NetworkDiscoveryError {
 // ================================================================================================
 // ENHANCED DATA STRUCTURES
 // ================================================================================================
-
 #[derive(Debug, Clone)]
 pub struct NetworkDevice {
     pub ip: IpAddr,
@@ -175,11 +292,9 @@ pub struct TcpFingerprint {
 // ================================================================================================
 // ADVANCED OS FINGERPRINTING (Simplified but Effective)
 // ================================================================================================
-
 pub struct AdvancedOSDetector {
     config: ScanConfig,
 }
-
 impl AdvancedOSDetector {
     pub fn new(config: ScanConfig) -> Self {
         Self { config }
@@ -189,7 +304,7 @@ impl AdvancedOSDetector {
     pub async fn detect_operating_system(&self, device: &NetworkDevice) -> (Option<OperatingSystem>, f32) {
         let mut confidence = 0.0f32;
         let mut detected_os: Option<OperatingSystem> = None;
-        
+
         // Method 1: Service Banner Analysis (most reliable)
         let (os_from_banner, banner_conf) = self.analyze_service_banners(&device.services);
         if banner_conf > confidence {
@@ -237,7 +352,6 @@ impl AdvancedOSDetector {
     fn analyze_service_banners(&self, services: &[NetworkService]) -> (Option<OperatingSystem>, f32) {
         let mut max_confidence = 0.0;
         let mut detected_os = None;
-
         for service in services {
             if let Some(ref banner) = service.banner {
                 let banner_lower = banner.to_lowercase();
@@ -249,14 +363,12 @@ impl AdvancedOSDetector {
                     135 | 445 => self.analyze_windows_service_banner(&banner_lower),
                     _ => (None, 0.0),
                 };
-
                 if confidence > max_confidence {
                     max_confidence = confidence;
                     detected_os = os;
                 }
             }
         }
-
         (detected_os, max_confidence)
     }
 
@@ -345,7 +457,7 @@ impl AdvancedOSDetector {
 
     fn analyze_port_patterns(&self, ports: &[u16]) -> (Option<OperatingSystem>, f32) {
         let port_set: std::collections::HashSet<u16> = ports.iter().cloned().collect();
-        
+
         // Strong Windows indicators
         if port_set.contains(&135) && port_set.contains(&445) && port_set.contains(&139) {
             if port_set.contains(&3389) {
@@ -354,12 +466,12 @@ impl AdvancedOSDetector {
                 return (Some(OperatingSystem::Windows(None)), 0.8);
             }
         }
-        
+
         // Windows-only RDP
         if port_set.contains(&3389) && !port_set.contains(&22) {
             return (Some(OperatingSystem::Windows(None)), 0.75);
         }
-        
+
         // Linux server patterns
         if port_set.contains(&22) && (port_set.contains(&80) || port_set.contains(&443)) {
             if port_set.contains(&3306) || port_set.contains(&5432) {
@@ -368,17 +480,17 @@ impl AdvancedOSDetector {
                 return (Some(OperatingSystem::Linux(None)), 0.65);
             }
         }
-        
+
         // SSH without other services (embedded/IoT)
         if port_set.contains(&22) && ports.len() <= 2 {
             return (Some(OperatingSystem::Linux(Some("Embedded".to_string()))), 0.6);
         }
-        
+
         // Router/embedded patterns (only web interface)
         if (port_set.contains(&80) || port_set.contains(&443)) && ports.len() <= 3 && !port_set.contains(&22) {
             return (Some(OperatingSystem::RouterOS), 0.7);
         }
-        
+
         (None, 0.0)
     }
 
@@ -395,7 +507,6 @@ impl AdvancedOSDetector {
 
     fn infer_os_from_vendor(&self, vendor: &str) -> (Option<OperatingSystem>, f32) {
         let vendor_lower = vendor.to_lowercase();
-        
         if vendor_lower.contains("apple") {
             (Some(OperatingSystem::MacOS(None)), 0.7)
         } else if vendor_lower.contains("microsoft") {
@@ -413,7 +524,6 @@ impl AdvancedOSDetector {
 
     fn analyze_hostname_for_os(&self, hostname: &str) -> (Option<OperatingSystem>, f32) {
         let hostname_lower = hostname.to_lowercase();
-        
         if hostname_lower.contains("android") {
             (Some(OperatingSystem::Android(None)), 0.8)
         } else if hostname_lower.contains("iphone") || hostname_lower.contains("ipad") {
@@ -443,7 +553,6 @@ impl AdvancedOSDetector {
 
         // Test multiple ports for timing patterns
         let test_ports = [22, 80, 443, 21, 25, 23];
-        
         for &port in &test_ports {
             let start = Instant::now();
             if let Ok(connect_result) = timeout(
@@ -452,10 +561,8 @@ impl AdvancedOSDetector {
             ).await {
                 let elapsed = start.elapsed();
                 response_times.push(elapsed.as_millis() as u64);
-                
                 if let Ok(mut stream) = connect_result {
                     successful_connections += 1;
-                    
                     // Try to grab banner for additional characteristics
                     let mut buf = vec![0; 512];
                     if let Ok(Ok(count)) = timeout(
@@ -513,18 +620,16 @@ impl AdvancedOSDetector {
 // ================================================================================================
 // ENHANCED DETECTION STRATEGIES
 // ================================================================================================
-
 pub struct EnhancedPortScanStrategy {
     common_ports: Vec<u16>,
-    config: ScanConfig,
+    config: Arc<ScanConfig>, // Now Arc
     os_detector: Arc<AdvancedOSDetector>,
 }
-
 impl EnhancedPortScanStrategy {
     pub fn new(config: ScanConfig, os_detector: Arc<AdvancedOSDetector>) -> Self {
         Self {
             common_ports: config.common_ports.clone(),
-            config,
+            config: Arc::new(config),
             os_detector,
         }
     }
@@ -610,7 +715,6 @@ impl EnhancedPortScanStrategy {
 
     fn extract_version_from_banner(banner: &str) -> Option<String> {
         let banner_lower = banner.to_lowercase();
-        
         // Common version patterns
         let patterns = [
             ("apache/", "apache"),
@@ -621,7 +725,6 @@ impl EnhancedPortScanStrategy {
             ("postfix", "postfix"),
             ("sendmail ", "sendmail"),
         ];
-        
         for (prefix, service) in &patterns {
             if let Some(start) = banner_lower.find(prefix) {
                 let version_start = start + prefix.len();
@@ -677,7 +780,6 @@ impl EnhancedPortScanStrategy {
         for service in &device.services {
             if let Some(ref banner) = service.banner {
                 let banner_lower = banner.to_lowercase();
-                
                 // More specific OS detection from banners
                 if banner_lower.contains("ubuntu") {
                     device.operating_system = Some(OperatingSystem::Linux(Some("Ubuntu".to_string())));
@@ -713,22 +815,21 @@ impl DeviceDetectionStrategy for EnhancedPortScanStrategy {
 
     async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
         let ip = device.ip;
-        let mut port_handles = Vec::new();
+        let mut open_ports = Vec::new();
+        let mut services = Vec::new();
 
-        for &port in &self.common_ports {
-            let handle = tokio::spawn({
+        let port_stream = stream::iter(self.common_ports.iter().copied())
+            .map(|port| {
                 let ip = ip;
                 let config = self.config.clone();
                 async move {
                     let mut open_port_info: Option<(u16, NetworkService)> = None;
-
                     if let Ok(connect_result) = timeout(
                         Duration::from_millis(config.tcp_connect_timeout_ms),
                         TcpStream::connect((ip, port))
                     ).await {
                         if let Ok(_stream) = connect_result {
                             let (service_name, service_type) = Self::get_enhanced_service_info(port);
-                            
                             let mut service = NetworkService {
                                 port,
                                 protocol: "TCP".to_string(),
@@ -738,32 +839,29 @@ impl DeviceDetectionStrategy for EnhancedPortScanStrategy {
                                 version: None,
                                 txt_records: Vec::new(),
                             };
-
                             // Enhanced banner grabbing
                             if let Some(banner) = Self::enhanced_banner_grab(&config, ip, port).await {
                                 service.banner = Some(banner.clone());
                                 service.version = Self::extract_version_from_banner(&banner);
                             }
-
                             open_port_info = Some((port, service));
                         }
                     }
                     open_port_info
                 }
-            });
+            })
+            .buffer_unordered(self.config.max_concurrent_scans);
 
-            port_handles.push(handle);
-        }
-
-        let results = join_all(port_handles).await;
-
-        for result in results {
-            if let Ok(Some((port, service))) = result {
-                device.open_ports.push(port);
-                device.services.push(service);
+        pin_mut!(port_stream);
+        while let Some(result) = port_stream.next().await {
+            if let Some((port, service)) = result {
+                open_ports.push(port);
+                services.push(service);
             }
         }
 
+        device.open_ports = open_ports;
+        device.services = services;
         device.open_ports.sort();
         device.open_ports.dedup();
 
@@ -784,11 +882,9 @@ impl DeviceDetectionStrategy for EnhancedPortScanStrategy {
 // ================================================================================================
 // ENHANCED MAC ADDRESS STRATEGY
 // ================================================================================================
-
 pub struct EnhancedMacAddressStrategy {
     vendor_db: Arc<Mutex<MacVendorDatabase>>,
 }
-
 impl EnhancedMacAddressStrategy {
     pub fn new(vendor_db: Arc<Mutex<MacVendorDatabase>>) -> Self {
         Self { vendor_db }
@@ -797,7 +893,6 @@ impl EnhancedMacAddressStrategy {
     fn advanced_device_classification(&self, vendor: &str, mac: &str) -> (DeviceType, Option<OperatingSystem>) {
         let vendor_lower = vendor.to_lowercase();
         let mac_upper = mac.to_uppercase();
-        
         match vendor_lower.as_str() {
             v if v.contains("apple") => {
                 // Apple device classification by OUI patterns
@@ -857,16 +952,12 @@ impl DeviceDetectionStrategy for EnhancedMacAddressStrategy {
                 let mut db = self.vendor_db.lock().await;
                 db.get_device_info(mac)
             };
-            
             if let Some(info) = vendor_info {
                 device.vendor = Some(info.vendor.clone());
-                
                 let (inferred_type, inferred_os) = self.advanced_device_classification(&info.vendor, mac);
-                
                 if device.device_type == DeviceType::Unknown {
                     device.device_type = inferred_type;
                 }
-                
                 if device.operating_system.is_none() && inferred_os.is_some() {
                     device.operating_system = inferred_os;
                 }
@@ -879,11 +970,9 @@ impl DeviceDetectionStrategy for EnhancedMacAddressStrategy {
 // ================================================================================================
 // ENHANCED HOSTNAME STRATEGY
 // ================================================================================================
-
 pub struct EnhancedHostnameStrategy {
     resolver: TokioAsyncResolver,
 }
-
 impl EnhancedHostnameStrategy {
     pub fn new() -> Result<Self, NetworkDiscoveryError> {
         let resolver = TokioAsyncResolver::tokio_from_system_conf()
@@ -893,7 +982,7 @@ impl EnhancedHostnameStrategy {
 
     fn generate_intelligent_hostname(&self, device: &mut NetworkDevice) {
         let mut hostname_parts = Vec::new();
-        
+
         // Vendor-based naming
         if let Some(ref vendor) = device.vendor {
             let vendor_lower = vendor.to_lowercase();
@@ -934,7 +1023,6 @@ impl EnhancedHostnameStrategy {
             DeviceType::IoTDevice => "iot",
             _ => "device",
         };
-
         if hostname_parts.is_empty() || hostname_parts[0] != device_suffix {
             hostname_parts.push(device_suffix.to_string());
         }
@@ -955,7 +1043,6 @@ impl EnhancedHostnameStrategy {
                 _ => {}
             }
         }
-
         if !service_indicators.is_empty() {
             hostname_parts.extend(service_indicators.into_iter().take(2));
         }
@@ -964,14 +1051,13 @@ impl EnhancedHostnameStrategy {
         let ip_suffix = device.ip.to_string().replace(".", "-");
         let last_octet = ip_suffix.split('-').last().unwrap_or("x");
         hostname_parts.push(last_octet.to_string());
-
         let hostname = format!("{}.local", hostname_parts.join("-"));
         device.hostname = Some(hostname);
     }
 
     fn enhanced_hostname_analysis(&self, device: &mut NetworkDevice, hostname: &str) {
         let hostname_lower = hostname.to_lowercase();
-        
+
         // Apple devices
         if hostname_lower.ends_with(".local") {
             if hostname_lower.contains("iphone") {
@@ -1042,7 +1128,6 @@ impl DeviceDetectionStrategy for EnhancedHostnameStrategy {
 
     async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
         let ip = device.ip;
-        
         let hostname = match timeout(
             Duration::from_secs(2),
             self.resolver.reverse_lookup(ip)
@@ -1062,7 +1147,6 @@ impl DeviceDetectionStrategy for EnhancedHostnameStrategy {
         } else {
             self.generate_intelligent_hostname(device);
         }
-        
         Ok(())
     }
 }
@@ -1070,24 +1154,20 @@ impl DeviceDetectionStrategy for EnhancedHostnameStrategy {
 // ================================================================================================
 // ENHANCED NETWORK DISCOVERY ENGINE
 // ================================================================================================
-
 pub struct EnhancedNetworkDiscovery {
     strategies: Arc<Vec<Box<dyn DeviceDetectionStrategy>>>,
     config: ScanConfig,
     os_detector: Arc<AdvancedOSDetector>,
 }
-
 impl EnhancedNetworkDiscovery {
     pub fn new() -> Result<Self, NetworkDiscoveryError> {
         let config = ScanConfig::default();
         let vendor_db = Arc::new(Mutex::new(MacVendorDatabase::new()?));
         let os_detector = Arc::new(AdvancedOSDetector::new(config.clone()));
-        
         let mut strategies_vec: Vec<Box<dyn DeviceDetectionStrategy>> = Vec::new();
         strategies_vec.push(Box::new(EnhancedMacAddressStrategy::new(vendor_db.clone())));
         strategies_vec.push(Box::new(EnhancedPortScanStrategy::new(config.clone(), os_detector.clone())));
         strategies_vec.push(Box::new(EnhancedHostnameStrategy::new()?));
-        
         Ok(Self {
             strategies: Arc::new(strategies_vec),
             config,
@@ -1102,23 +1182,27 @@ impl EnhancedNetworkDiscovery {
             ));
         }
 
+        // Only support /24 for now
+        if !network.ends_with("/24") {
+            return Err(NetworkDiscoveryError::PingError(
+                "Only /24 networks are currently supported".to_string()
+            ));
+        }
+
         let scan_start = Instant::now();
         println!("Enhanced Network Discovery Tool - Starting scan for {}", network);
         println!("====================================================================");
-        
+
         let active_ips = self.parallel_ping_sweep(network).await?;
-        
         println!("Found {} active devices", active_ips.len());
         println!("Starting enhanced fingerprinting scan...\n");
 
         let discovered_devices = Arc::new(Mutex::new(HashMap::<IpAddr, NetworkDevice>::new()));
         let (tx, mut rx) = mpsc::channel::<NetworkDevice>(active_ips.len());
-        
         let total_devices = active_ips.len();
         let mut completed = 0;
-        
+
         let interface_name_for_arp = find_network_interface(network)?;
-        
         if interface_name_for_arp.is_none() {
             println!("Warning: No suitable network interface found. MAC address detection may be limited.");
         }
@@ -1126,13 +1210,11 @@ impl EnhancedNetworkDiscovery {
         // Enhanced scanning tasks
         for ip in active_ips {
             println!("Scanning device {} with enhanced detection", ip);
-            
             let strategies = self.strategies.clone();
             let tx_clone = tx.clone();
             let os_detector = self.os_detector.clone();
             let arp_timeout = Duration::from_millis(self.config.ping_timeout_ms);
             let interface_name_for_arp_clone = interface_name_for_arp.clone();
-
             tokio::spawn(async move {
                 let mac = if let IpAddr::V4(ipv4) = ip {
                     if let Some(ref iface_name) = interface_name_for_arp_clone {
@@ -1188,19 +1270,20 @@ impl EnhancedNetworkDiscovery {
 
         drop(tx);
 
-        // Process results
+        // Process results with cleaner progress
+        use std::io::Write;
         while let Some(device) = rx.recv().await {
             completed += 1;
-            println!("Completed {}/{} devices ({:.1}%)", 
-                     completed, total_devices, (completed as f32 / total_devices as f32) * 100.0);
-            
+            print!("\rProgress: {}/{} devices ({:.1}%)", 
+                   completed, total_devices, (completed as f32 / total_devices as f32) * 100.0);
+            std::io::stdout().flush().ok();
             let mut devices_map = discovered_devices.lock().await;
             devices_map.insert(device.ip, device);
         }
+        println!(); // newline after progress
 
         // Display enhanced results
         self.display_enhanced_results(&discovered_devices, scan_start.elapsed()).await;
-        
         Ok(())
     }
 
@@ -1213,7 +1296,6 @@ impl EnhancedNetworkDiscovery {
 
         let mut os_detected_count = 0;
         let mut high_confidence_count = 0;
-
         for (_, device) in devices_map.iter() {
             if device.operating_system.is_some() {
                 os_detected_count += 1;
@@ -1300,14 +1382,13 @@ impl EnhancedNetworkDiscovery {
         }
 
         println!("{}", table);
-        
+
         // Enhanced statistics
         let detection_rate = if !devices_map.is_empty() {
             (os_detected_count as f32 / devices_map.len() as f32) * 100.0
         } else {
             0.0
         };
-
         let high_confidence_rate = if os_detected_count > 0 {
             (high_confidence_count as f32 / os_detected_count as f32) * 100.0
         } else {
@@ -1324,13 +1405,10 @@ impl EnhancedNetworkDiscovery {
 
     async fn parallel_ping_sweep(&self, network: &str) -> Result<Vec<IpAddr>, NetworkDiscoveryError> {
         let ping_timeout = Duration::from_millis(self.config.ping_timeout_ms);
-        
         if let Some(base) = network.strip_suffix("/24") {
             let base_parts: Vec<&str> = base.split('.').collect();
-            
             if base_parts.len() == 4 {
                 let base_ip_str = format!("{}.{}.{}.", base_parts[0], base_parts[1], base_parts[2]);
-                
                 let ping_stream = stream::iter(1..255)
                     .map(|i| {
                         let ip_str = format!("{}{}", base_ip_str, i);
@@ -1339,7 +1417,6 @@ impl EnhancedNetworkDiscovery {
                             if let Ok(ip) = Ipv4Addr::from_str(&ip_str) {
                                 let target_ip: IpAddr = ip.into();
                                 let payload = [0; 56];
-                                
                                 match timeout(ping_timeout, ping(target_ip, &payload)).await {
                                     Ok(Ok((_icmp_packet, _duration))) => Some(target_ip),
                                     _ => None,
@@ -1355,11 +1432,9 @@ impl EnhancedNetworkDiscovery {
                     .filter_map(|result| async move { result })
                     .collect()
                     .await;
-                    
                 return Ok(active_ips);
             }
         }
-        
         Ok(Vec::new())
     }
 }
@@ -1367,7 +1442,6 @@ impl EnhancedNetworkDiscovery {
 // ================================================================================================
 // HELPER FUNCTIONS
 // ================================================================================================
-
 fn parse_cidr_network(network: &str) -> Result<(Ipv4Addr, u8), NetworkDiscoveryError> {
     let parts: Vec<&str> = network.split('/').collect();
     if parts.len() != 2 {
@@ -1375,18 +1449,15 @@ fn parse_cidr_network(network: &str) -> Result<(Ipv4Addr, u8), NetworkDiscoveryE
             "Invalid CIDR format".to_string()
         ));
     }
-    
     let network_ip = Ipv4Addr::from_str(parts[0])
         .map_err(|e| NetworkDiscoveryError::PingError(format!("Invalid IP address: {}", e)))?;
     let prefix_len = parts[1].parse::<u8>()
         .map_err(|e| NetworkDiscoveryError::PingError(format!("Invalid prefix length: {}", e)))?;
-    
     if prefix_len > 32 {
         return Err(NetworkDiscoveryError::PingError(
             "Invalid prefix length: must be <= 32".to_string()
         ));
     }
-    
     Ok((network_ip, prefix_len))
 }
 
@@ -1394,22 +1465,18 @@ fn is_ip_in_subnet(ip: Ipv4Addr, network: Ipv4Addr, prefix_len: u8) -> bool {
     if prefix_len > 32 {
         return false;
     }
-    
     let mask = if prefix_len == 0 {
         0
     } else {
         !((1u32 << (32 - prefix_len)) - 1)
     };
-    
     let ip_bits = u32::from(ip);
     let network_bits = u32::from(network);
-    
     (ip_bits & mask) == (network_bits & mask)
 }
 
 fn get_network_from_interface(interface_name: &str) -> Result<String, NetworkDiscoveryError> {
     let interfaces = NetworkInterface::show()?;
-    
     for interface in interfaces {
         if interface.name == interface_name {
             for addr in &interface.addr {
@@ -1423,7 +1490,6 @@ fn get_network_from_interface(interface_name: &str) -> Result<String, NetworkDis
             }
         }
     }
-    
     Err(NetworkDiscoveryError::NetworkInterfaceError(
         format!("Interface '{}' not found or has no valid IPv4 address", interface_name)
     ))
@@ -1431,7 +1497,6 @@ fn get_network_from_interface(interface_name: &str) -> Result<String, NetworkDis
 
 fn calculate_network_cidr(ip: Ipv4Addr) -> Result<String, NetworkDiscoveryError> {
     let ip_octets = ip.octets();
-    
     let network = match ip_octets {
         [192, 168, third, _] => format!("192.168.{}.0/24", third),
         [10, second, third, _] => format!("10.{}.{}.0/24", second, third),
@@ -1440,13 +1505,11 @@ fn calculate_network_cidr(ip: Ipv4Addr) -> Result<String, NetworkDiscoveryError>
         },
         [first, second, third, _] => format!("{}.{}.{}.0/24", first, second, third),
     };
-    
     Ok(network)
 }
 
 fn list_network_interfaces() -> Result<(), NetworkDiscoveryError> {
     let interfaces = NetworkInterface::show()?;
-    
     println!("Available network interfaces:");
     for interface in interfaces {
         println!("  Interface: {}", interface.name);
@@ -1464,11 +1527,8 @@ fn list_network_interfaces() -> Result<(), NetworkDiscoveryError> {
 
 fn find_network_interface(target_network: &str) -> Result<Option<String>, NetworkDiscoveryError> {
     let (network_ip, prefix_len) = parse_cidr_network(target_network)?;
-    
     println!("Looking for interface with IP in network: {} (/{}) ", network_ip, prefix_len);
-    
     let interfaces = NetworkInterface::show()?;
-    
     for interface in interfaces {
         for addr in &interface.addr {
             if let IpAddr::V4(ipv4) = addr.ip() {
@@ -1479,17 +1539,14 @@ fn find_network_interface(target_network: &str) -> Result<Option<String>, Networ
             }
         }
     }
-    
     println!("No interface found in target network, looking for default interface...");
     let interfaces = NetworkInterface::show()?;
-    
     for interface in interfaces {
         if interface.name.starts_with("lo") || 
            interface.name.starts_with("docker") || 
            interface.name.starts_with("veth") {
             continue;
         }
-        
         for addr in &interface.addr {
             if let IpAddr::V4(ipv4) = addr.ip() {
                 if !ipv4.is_loopback() && !ipv4.is_unspecified() {
@@ -1499,7 +1556,6 @@ fn find_network_interface(target_network: &str) -> Result<Option<String>, Networ
             }
         }
     }
-    
     println!("Warning: No suitable network interface found for ARP operations");
     Ok(None)
 }
@@ -1507,7 +1563,6 @@ fn find_network_interface(target_network: &str) -> Result<Option<String>, Networ
 // ================================================================================================
 // DEVICE DETECTION TRAIT
 // ================================================================================================
-
 #[async_trait]
 pub trait DeviceDetectionStrategy: Send + Sync {
     async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError>;
@@ -1517,29 +1572,24 @@ pub trait DeviceDetectionStrategy: Send + Sync {
 // ================================================================================================
 // MAC VENDOR DATABASE
 // ================================================================================================
-
 pub struct MacVendorDatabase {
     oui_db: OuiDatabase,
     vendor_cache: HashMap<String, String>,
 }
-
 impl MacVendorDatabase {
     pub fn new() -> Result<Self, NetworkDiscoveryError> {
         println!("Loading OUI database...");
-        let file_path = "manuf.txt";
-        let oui_db = match OuiDatabase::new_from_file(file_path) {
+        let oui_db = match OuiDatabase::new_from_str(MANUF_DATA) {
             Ok(db) => {
                 println!("OUI database loaded successfully");
                 db
             },
-            Err(e) => {
-                eprintln!("Failed to load {}: {}. Using fallback database.", file_path, e);
-                println!("Using fallback OUI database (this will result in missing vendor info)");
-                OuiDatabase::new_from_str("")
+            Err(_) => {
+                eprintln!("Failed to load manuf.txt. Using built-in OUI fallback.");
+                OuiDatabase::new_from_str(BUILTIN_OUI)
                     .map_err(|e| NetworkDiscoveryError::OuiDatabaseError(e.to_string()))?
             }
         };
-        
         Ok(Self {
             oui_db,
             vendor_cache: HashMap::new(),
@@ -1551,7 +1601,6 @@ impl MacVendorDatabase {
         if let Some(vendor) = self.vendor_cache.get(&clean_mac) {
             return Some(vendor.clone());
         }
-        
         if let Ok(mac_addr) = MacAddress::parse_str(&clean_mac) {
             if let Ok(Some(entry)) = self.oui_db.query_by_mac(&mac_addr) {
                 let vendor = entry.name_long.clone().unwrap_or_default();
@@ -1577,7 +1626,6 @@ impl MacVendorDatabase {
     fn normalize_mac(&self, mac: &str) -> Option<String> {
         let cleaned = mac.replace("-", ":").replace(".", ":").to_uppercase();
         let parts: Vec<&str> = cleaned.split(':').collect();
-        
         if parts.len() == 6 && parts.iter().all(|p| p.len() == 2) {
             Some(cleaned)
         } else if cleaned.len() == 12 && cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1605,17 +1653,13 @@ pub struct DeviceInfo {
 // ================================================================================================
 // MAIN APPLICATION
 // ================================================================================================
-
 #[tokio::main]
 async fn main() -> Result<(), NetworkDiscoveryError> {
     println!("Enhanced Network Discovery Tool v2.0");
     println!("=====================================");
-    
     let args: Vec<String> = std::env::args().collect();
-    
     let network = if args.len() > 1 {
         let arg = &args[1];
-        
         if arg == "--help" || arg == "-h" {
             println!("Usage:");
             println!("  {} [INTERFACE_NAME|CIDR_NETWORK]", args[0]);
@@ -1633,12 +1677,10 @@ async fn main() -> Result<(), NetworkDiscoveryError> {
             list_network_interfaces()?;
             return Ok(());
         }
-        
         if arg == "--list" {
             list_network_interfaces()?;
             return Ok(());
         }
-        
         if arg.contains('/') {
             arg.clone()
         } else {
@@ -1663,12 +1705,11 @@ async fn main() -> Result<(), NetworkDiscoveryError> {
         list_network_interfaces()?;
         return Ok(());
     };
-    
+
     println!("Target network: {}", network);
     println!();
-    
+
     let discovery = EnhancedNetworkDiscovery::new()?;
     discovery.discover_network_enhanced(&network).await?;
-    
     Ok(())
 }

@@ -22,7 +22,12 @@ futures = "0.3"
 network-interface = "2.0"
 trust-dns-resolver = "0.23"
 arp-toolkit = "0.3.2"
-etherparse = "0.19"
+# etherparse = "0.19"
+# log = "0.4.28"
+# num_cpus = "1.17.0"
+# thiserror = "2.0.16"
+# env_logger = "0.11.8"
+
 
 [profile.release]
 opt-level = 3
