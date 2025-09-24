@@ -984,6 +984,7 @@ dependencies = [
  "oui",
  "regex",
  "surge-ping",
+ "thiserror 2.0.16",
  "tokio",
  "trust-dns-resolver",
 ]

@@ -2,8 +2,8 @@
 use async_trait::async_trait;
 use comfy_table::{Cell, Table};
 use eui48::MacAddress;
-use futures::pin_mut;
 use futures::stream::{self, StreamExt};
+use futures::pin_mut;
 use oui::OuiDatabase;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -18,9 +18,7 @@ use tokio::time::timeout;
 use trust_dns_resolver::TokioAsyncResolver;
 use libarp::client::ArpClient;
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
-
-// Embed manuf.txt at compile time
-const MANUF_DATA: &str = include_str!("../manuf.txt");
+use thiserror::Error;
 
 // Built-in OUI fallback for basic vendor detection
 const BUILTIN_OUI: &str = r#"
@@ -46,103 +44,41 @@ B8:27:EB   Raspberry Pi Foundation
 00:01:96   Cisco Systems, Inc
 00:01:97   Cisco Systems, Inc
 00:02:16   Cisco Systems, Inc
-00:02:17   Cisco Systems, Inc
-00:02:4A   Cisco Systems, Inc
-00:02:4B   Cisco Systems, Inc
-00:02:FD   Cisco Systems, Inc
-00:03:32   Cisco Systems, Inc
-00:03:6F   Cisco Systems, Inc
-00:03:E3   Cisco Systems, Inc
-00:04:27   Cisco Systems, Inc
-00:04:9A   Cisco Systems, Inc
-00:04:C1   Cisco Systems, Inc
-00:05:5E   Cisco Systems, Inc
-00:05:AC   Cisco Systems, Inc
-00:06:28   Cisco Systems, Inc
-00:06:5B   Cisco Systems, Inc
-00:07:0E   Cisco Systems, Inc
-00:07:4F   Cisco Systems, Inc
-00:07:7D   Cisco Systems, Inc
-00:07:EA   Cisco Systems, Inc
-00:08:2F   Cisco Systems, Inc
-00:08:74   Cisco Systems, Inc
-00:08:E3   Cisco Systems, Inc
-00:09:11   Cisco Systems, Inc
-00:09:7C   Cisco Systems, Inc
-00:0A:41   Cisco Systems, Inc
-00:0A:DC   Cisco Systems, Inc
-00:0B:5F   Cisco Systems, Inc
-00:0B:BE   Cisco Systems, Inc
-00:0C:30   Cisco Systems, Inc
-00:0C:85   Cisco Systems, Inc
-00:0D:28   Cisco Systems, Inc
-00:0D:BD   Cisco Systems, Inc
-00:0E:35   Cisco Systems, Inc
-00:0E:8C   Cisco Systems, Inc
-00:0F:34   Cisco Systems, Inc
-00:0F:8F   Cisco Systems, Inc
-00:10:07   Cisco Systems, Inc
-00:10:2F   Cisco Systems, Inc
-00:10:7B   Cisco Systems, Inc
-00:10:C6   Cisco Systems, Inc
-00:11:20   Cisco Systems, Inc
-00:11:92   Cisco Systems, Inc
-00:11:9B   Cisco Systems, Inc
-00:12:00   Cisco Systems, Inc
-00:12:43   Cisco Systems, Inc
-00:12:80   Cisco Systems, Inc
-00:12:D9   Cisco Systems, Inc
-00:13:1A   Cisco Systems, Inc
-00:13:5F   Cisco Systems, Inc
-00:13:C3   Cisco Systems, Inc
-00:14:1C   Cisco Systems, Inc
-00:14:A8   Cisco Systems, Inc
-00:14:F2   Cisco Systems, Inc
-00:15:2B   Cisco Systems, Inc
-00:15:60   Cisco Systems, Inc
-00:15:96   Cisco Systems, Inc
-00:16:41   Cisco Systems, Inc
-00:16:C7   Cisco Systems, Inc
-00:17:59   Cisco Systems, Inc
-00:17:95   Cisco Systems, Inc
-00:17:D3   Cisco Systems, Inc
-00:18:74   Cisco Systems, Inc
-00:18:B9   Cisco Systems, Inc
-00:19:30   Cisco Systems, Inc
-00:19:AA   Cisco Systems, Inc
-00:1A:2F   Cisco Systems, Inc
-00:1A:64   Cisco Systems, Inc
-00:1A:A2   Cisco Systems, Inc
-00:1B:0C   Cisco Systems, Inc
-00:1B:54   Cisco Systems, Inc
-00:1B:D5   Cisco Systems, Inc
-00:1C:58   Cisco Systems, Inc
-00:1C:DF   Cisco Systems, Inc
-00:1D:45   Cisco Systems, Inc
-00:1D:A2   Cisco Systems, Inc
-00:1E:13   Cisco Systems, Inc
-00:1E:49   Cisco Systems, Inc
-00:1E:B7   Cisco Systems, Inc
-00:1F:6C   Cisco Systems, Inc
-00:1F:90   Cisco Systems, Inc
-00:1F:CA   Cisco Systems, Inc
-00:21:1B   Cisco Systems, Inc
-00:21:55   Cisco Systems, Inc
-00:21:56   Cisco Systems, Inc
-00:22:55   Cisco Systems, Inc
-00:22:90   Cisco Systems, Inc
-00:23:33   Cisco Systems, Inc
-00:23:AB   Cisco Systems, Inc
-00:24:10   Cisco Systems, Inc
-00:24:50   Cisco Systems, Inc
-00:24:97   Cisco Systems, Inc
-00:25:45   Cisco Systems, Inc
-00:25:83   Cisco Systems, Inc
-00:26:52   Cisco Systems, Inc
-00:26:CB   Cisco Systems, Inc
-00:27:0D   Cisco Systems, Inc
-00:27:10   Cisco Systems, Inc
+
 "#;
+
+// ================================================================================================
+// ENHANCED ERROR HANDLING with thiserror
+// ================================================================================================
+#[derive(Error, Debug)]
+pub enum NetworkDiscoveryError {
+    #[error("OUI Database Error: {0}")]
+    OuiDatabaseError(String),
+
+    #[error("Ping Error: {0}")]
+    PingError(String),
+
+    #[error("Port Scan Error: {0}")]
+    PortScanError(String),
+
+    #[error("Hostname Resolution Error: {0}")]
+    HostnameResolutionError(String),
+
+    #[error("I/O Error: {0}")]
+    IoError(#[from] std::io::Error),
+
+    #[error("Network Interface Error: {0}")]
+    NetworkInterfaceWrapped(#[from] network_interface::Error),
+       
+    #[error("Network Interface Error: {0}")]
+    NetworkInterfaceCustom(String),
+
+    #[error("Fingerprint Error: {0}")]
+    FingerprintError(String),
+
+    #[error("Error: {0}")]
+    Other(String),
+}
 
 // ================================================================================================
 // ENHANCED CONFIGURATION
@@ -169,51 +105,6 @@ impl Default for ScanConfig {
             max_concurrent_scans: 64,
             enable_advanced_fingerprinting: true,
         }
-    }
-}
-
-// ================================================================================================
-// ENHANCED ERROR HANDLING
-// ================================================================================================
-#[derive(Debug)]
-pub enum NetworkDiscoveryError {
-    OuiDatabaseError(String),
-    PingError(String),
-    PortScanError(String),
-    HostnameResolutionError(String),
-    IoError(std::io::Error),
-    NetworkInterfaceError(String),
-    FingerprintError(String),
-    Other(String),
-}
-impl std::fmt::Display for NetworkDiscoveryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NetworkDiscoveryError::OuiDatabaseError(msg) => write!(f, "OUI Database Error: {}", msg),
-            NetworkDiscoveryError::PingError(msg) => write!(f, "Ping Error: {}", msg),
-            NetworkDiscoveryError::PortScanError(msg) => write!(f, "Port Scan Error: {}", msg),
-            NetworkDiscoveryError::HostnameResolutionError(msg) => write!(f, "Hostname Resolution Error: {}", msg),
-            NetworkDiscoveryError::IoError(err) => write!(f, "I/O Error: {}", err),
-            NetworkDiscoveryError::NetworkInterfaceError(msg) => write!(f, "Network Interface Error: {}", msg),
-            NetworkDiscoveryError::FingerprintError(msg) => write!(f, "Fingerprint Error: {}", msg),
-            NetworkDiscoveryError::Other(msg) => write!(f, "Error: {}", msg),
-        }
-    }
-}
-impl std::error::Error for NetworkDiscoveryError {}
-impl From<std::io::Error> for NetworkDiscoveryError {
-    fn from(error: std::io::Error) -> Self {
-        NetworkDiscoveryError::IoError(error)
-    }
-}
-impl From<String> for NetworkDiscoveryError {
-    fn from(error: String) -> Self {
-        NetworkDiscoveryError::Other(error)
-    }
-}
-impl From<network_interface::Error> for NetworkDiscoveryError {
-    fn from(error: network_interface::Error) -> Self {
-        NetworkDiscoveryError::NetworkInterfaceError(error.to_string())
     }
 }
 
@@ -622,7 +513,7 @@ impl AdvancedOSDetector {
 // ================================================================================================
 pub struct EnhancedPortScanStrategy {
     common_ports: Vec<u16>,
-    config: Arc<ScanConfig>, // Now Arc
+    config: Arc<ScanConfig>,
     os_detector: Arc<AdvancedOSDetector>,
 }
 impl EnhancedPortScanStrategy {
@@ -1490,7 +1381,7 @@ fn get_network_from_interface(interface_name: &str) -> Result<String, NetworkDis
             }
         }
     }
-    Err(NetworkDiscoveryError::NetworkInterfaceError(
+    Err(NetworkDiscoveryError::NetworkInterfaceCustom(
         format!("Interface '{}' not found or has no valid IPv4 address", interface_name)
     ))
 }
@@ -1579,7 +1470,7 @@ pub struct MacVendorDatabase {
 impl MacVendorDatabase {
     pub fn new() -> Result<Self, NetworkDiscoveryError> {
         println!("Loading OUI database...");
-        let oui_db = match OuiDatabase::new_from_str(MANUF_DATA) {
+        let oui_db = match OuiDatabase::new_from_file("manuf.txt") {
             Ok(db) => {
                 println!("OUI database loaded successfully");
                 db
