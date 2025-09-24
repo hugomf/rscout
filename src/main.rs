@@ -138,27 +138,76 @@ fn is_ip_in_subnet(ip: Ipv4Addr, network: Ipv4Addr, prefix_len: u8) -> bool {
     (ip_bits & mask) == (network_bits & mask)
 }
 
-/// Find the best network interface for ARP operations
+/// Get network configuration from an interface name
+fn get_network_from_interface(interface_name: &str) -> Result<String, NetworkDiscoveryError> {
+    let interfaces = NetworkInterface::show()?;
+    
+    for interface in interfaces {
+        if interface.name == interface_name {
+            // Find the first IPv4 address with a subnet mask
+            for addr in &interface.addr {
+                if let IpAddr::V4(ipv4) = addr.ip() {
+                    if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                        // Try to determine the network from the IP and common subnet masks
+                        let network = calculate_network_cidr(ipv4)?;
+                        println!("Interface {} has IP {}, calculated network: {}", interface_name, ipv4, network);
+                        return Ok(network);
+                    }
+                }
+            }
+        }
+    }
+    
+    Err(NetworkDiscoveryError::NetworkInterfaceError(
+        format!("Interface '{}' not found or has no valid IPv4 address", interface_name)
+    ))
+}
+
+/// Calculate the most likely network CIDR from an IP address
+fn calculate_network_cidr(ip: Ipv4Addr) -> Result<String, NetworkDiscoveryError> {
+    let ip_octets = ip.octets();
+    
+    // Common private network patterns
+    match ip_octets {
+        // 192.168.x.x -> /24 network
+        [192, 168, third, _] => Ok(format!("192.168.{}.0/24", third)),
+        // 10.x.x.x -> could be /8, /16, or /24, assume /24 for local networks
+        [10, second, third, _] => Ok(format!("10.{}.{}.0/24", second, third)),
+        // 172.16-31.x.x -> /24 network  
+        [172, second, third, _] if second >= 16 && second <= 31 => {
+            Ok(format!("172.{}.{}.0/24", second, third))
+        },
+        // For other addresses, assume /24
+        [first, second, third, _] => Ok(format!("{}.{}.{}.0/24", first, second, third)),
+    }
+}
+
+/// List all available network interfaces
+fn list_network_interfaces() -> Result<(), NetworkDiscoveryError> {
+    let interfaces = NetworkInterface::show()?;
+    
+    println!("Available network interfaces:");
+    for interface in interfaces {
+        println!("  Interface: {}", interface.name);
+        for addr in &interface.addr {
+            if let IpAddr::V4(ipv4) = addr.ip() {
+                if !ipv4.is_loopback() && !ipv4.is_unspecified() {
+                    let network = calculate_network_cidr(ipv4)?;
+                    println!("    IPv4: {} -> Network: {}", ipv4, network);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Find the best network interface for ARP operations (updated to work with CIDR)
 fn find_network_interface(target_network: &str) -> Result<Option<String>, NetworkDiscoveryError> {
     let (network_ip, prefix_len) = parse_cidr_network(target_network)?;
     
     println!("Looking for interface with IP in network: {} (/{}) ", network_ip, prefix_len);
     
     let interfaces = NetworkInterface::show()?;
-    
-    // Print all available interfaces for debugging
-    println!("Available network interfaces:");
-    for interface in &interfaces {
-        println!("  Interface: {}", interface.name);
-        for addr in &interface.addr {
-            if let IpAddr::V4(ipv4) = addr.ip() {
-                println!("    IPv4: {}", ipv4);
-                if is_ip_in_subnet(ipv4, network_ip, prefix_len) {
-                    println!("      -> This IP is in target subnet!");
-                }
-            }
-        }
-    }
     
     // Find interface with IP in target network
     for interface in interfaces {
@@ -1265,10 +1314,62 @@ async fn main() -> Result<(), NetworkDiscoveryError> {
     println!("================================================");
     
     let args: Vec<String> = std::env::args().collect();
+    
+    // Handle command line arguments
     let network = if args.len() > 1 {
-        args[1].clone()
+        let arg = &args[1];
+        
+        // Check if it's a help request
+        if arg == "--help" || arg == "-h" {
+            println!("Usage:");
+            println!("  {} [INTERFACE_NAME|CIDR_NETWORK]", args[0]);
+            println!();
+            println!("Examples:");
+            println!("  {} eth0                    # Scan network on eth0 interface", args[0]);
+            println!("  {} en0                     # Scan network on en0 interface (macOS)", args[0]);
+            println!("  {} wlan0                   # Scan network on wlan0 interface", args[0]);
+            println!("  {} 192.168.1.0/24          # Scan specific CIDR network", args[0]);
+            println!();
+            println!("Options:");
+            println!("  --list                     # List all available network interfaces");
+            println!("  --help, -h                 # Show this help message");
+            println!();
+            list_network_interfaces()?;
+            return Ok(());
+        }
+        
+        // Check if it's a list request
+        if arg == "--list" {
+            list_network_interfaces()?;
+            return Ok(());
+        }
+        
+        // Check if it looks like a CIDR network (contains '/')
+        if arg.contains('/') {
+            arg.clone()
+        } else {
+            // Assume it's an interface name, try to get the network from it
+            match get_network_from_interface(arg) {
+                Ok(network) => network,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    println!();
+                    list_network_interfaces()?;
+                    return Ok(());
+                }
+            }
+        }
     } else {
-        "192.168.1.0/24".to_string()
+        // No arguments provided, show help and available interfaces
+        println!("No arguments provided. Usage:");
+        println!("  {} [INTERFACE_NAME|CIDR_NETWORK]", args[0]);
+        println!();
+        println!("Examples:");
+        println!("  {} eth0                    # Scan network on eth0 interface", args[0]);
+        println!("  {} 192.168.1.0/24          # Scan specific CIDR network", args[0]);
+        println!();
+        list_network_interfaces()?;
+        return Ok(());
     };
     
     println!("Target network: {}", network);
