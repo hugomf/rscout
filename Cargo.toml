@@ -23,6 +23,9 @@ network-interface = "2.0"
 trust-dns-resolver = "0.23"
 arp-toolkit = "0.3.2"
 thiserror = "2.0.16"
+once_cell = "1.21.3"
+dns-lookup = "3.0.0"
+mdns-sd = "0.15.1"
 
 [profile.release]
 opt-level = 3
