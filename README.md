@@ -134,6 +134,7 @@ RScout uses multiple intelligent detection strategies:
 
 ## Dependencies
 
+### Core Dependencies
 - **tokio**: Async runtime for concurrent network operations
 - **oui**: MAC address OUI database for vendor lookup
 - **eui48**: MAC address parsing and validation
@@ -141,6 +142,18 @@ RScout uses multiple intelligent detection strategies:
 - **surge-ping**: High-performance ICMP ping implementation
 - **regex**: Regular expression support for parsing
 - **futures**: Async utilities and future combinators
+- **async-trait**: Async trait support for detection strategies
+- **network-interface**: Network interface enumeration
+- **trust-dns-resolver**: DNS resolution capabilities
+- **arp-toolkit**: ARP table lookup utilities
+- **dns-lookup**: DNS hostname resolution
+- **mdns-sd**: Multicast DNS service discovery
+- **thiserror**: Error handling utilities
+- **once_cell**: Lazy initialization utilities
+
+### Testing Dependencies
+- **tokio** (test features): Async testing support
+- **futures** (test features): Async test utilities
 
 ## File Structure
 
@@ -149,8 +162,31 @@ rscout/
 ├── Cargo.toml          # Project configuration and dependencies
 ├── src/
 │   ├── main.rs         # Main application entry point
+│   ├── lib.rs          # Library entry point (for testing)
+│   ├── config.rs       # Configuration structures
+│   ├── constants.rs    # Application constants
+│   ├── db.rs           # Database and vendor lookup
+│   ├── detect/         # Device detection strategies
+│   │   ├── mod.rs      # Detection module exports
+│   │   ├── hostname.rs # Hostname resolution strategy
+│   │   ├── mac.rs      # MAC address analysis strategy
+│   │   ├── os.rs       # Operating system detection
+│   │   └── port.rs     # Port scanning strategy
+│   ├── engine.rs       # Network discovery engine
+│   ├── errors.rs       # Error types and handling
+│   ├── model.rs        # Data models and structures
+│   ├── net.rs          # Network utilities
 │   └── table.rs        # Table formatting utilities
+├── tests/              # Comprehensive test suite
+│   ├── test_utils.rs   # Shared test utilities
+│   ├── hostname_tests.rs # Hostname strategy tests
+│   ├── mac_tests.rs    # MAC address strategy tests
+│   ├── os_tests.rs     # OS detection tests
+│   ├── port_tests.rs   # Port scanning tests
+│   ├── integration_tests.rs # Integration tests
+│   └── edge_case_tests.rs  # Edge case tests
 ├── manuf.txt           # OUI database for MAC vendor lookup
+├── oui.csv             # Additional OUI data
 └── README.md           # This file
 ```
 
@@ -168,6 +204,44 @@ rscout/
 - Respect network usage policies and privacy
 - Use only for legitimate security testing and network administration
 
+## Testing
+
+RScout includes a comprehensive test suite with 21 tests covering all detection strategies. The tests are organized by strategy for easy maintenance and development.
+
+### Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run tests by strategy
+cargo test --test hostname_tests    # Hostname detection tests (3 tests)
+cargo test --test mac_tests         # MAC address analysis tests (5 tests)
+cargo test --test os_tests          # OS detection tests (5 tests)
+cargo test --test port_tests        # Port scanning tests (2 tests)
+cargo test --test integration_tests # Integration tests (3 tests)
+cargo test --test edge_case_tests   # Edge case tests (3 tests)
+
+# Run with verbose output
+cargo test -- --nocapture
+
+# Run with backtrace on failure
+RUST_BACKTRACE=1 cargo test
+```
+
+### Test Coverage
+
+- **EnhancedHostnameStrategy**: Hostname resolution and fallback behavior
+- **EnhancedMacAddressStrategy**: MAC vendor lookup and device classification
+- **AdvancedOSDetector**: Operating system detection from services and ports
+- **EnhancedPortScanStrategy**: Port scanning and service detection
+- **Integration Tests**: Strategy combinations and complete workflows
+- **Edge Case Tests**: Error handling and boundary conditions
+
+### Test Architecture
+
+The test suite uses a modular architecture with shared utilities in `tests/test_utils.rs` and separate files for each detection strategy. This makes it easy to add new tests and maintain existing ones.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests or open issues for:
@@ -177,6 +251,7 @@ Contributions are welcome! Please feel free to submit pull requests or open issu
 - Additional device type support
 - Performance improvements
 - Documentation enhancements
+- Test improvements and new test cases
 
 ## License
 

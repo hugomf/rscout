@@ -6,6 +6,10 @@ description = "A comprehensive network discovery tool written in Rust"
 authors = ["Your Name <your.email@example.com>"]
 license = "MIT"
 
+[lib]
+name = "rscout"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rscout"
 path = "src/main.rs"

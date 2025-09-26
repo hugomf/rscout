@@ -83,18 +83,8 @@ pub struct EnhancedHostnameStrategy;
             best.cloned()
         }
 
-        async fn hostname_resolves_to_ip(&self, hostname: &str, target_ip: IpAddr) -> bool {
-            let addrs = tokio::task::block_in_place(|| {
-                dns_lookup::getaddrinfo(Some(hostname), None, None)
-                    .map(|iter| iter.filter_map(Result::ok).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            });
-            addrs.iter().any(|ai| ai.sockaddr.ip() == target_ip)
-        }
-
-        fn reverse_dns(&self, ip: IpAddr) -> Option<String> {
-            tokio::task::block_in_place(|| lookup_addr(&ip).ok())
-        }
+        // Note: These methods were used in the original implementation but are now
+        // handled directly in the detect method to avoid blocking issues
     }
 
     #[async_trait]
@@ -105,12 +95,18 @@ pub struct EnhancedHostnameStrategy;
 
         async fn detect(&self, device: &mut NetworkDevice) -> Result<(), NetworkDiscoveryError> {
             let ip = device.ip;
-            let host = self
-                .mdns_instance(ip)
-                .await
-                .or_else(|| self.reverse_dns(ip))
-                .unwrap_or_else(|| "N/A".to_string());
-            device.hostname = Some(host);
+            
+            // Try mDNS first
+            let host = if let Some(hostname) = self.mdns_instance(ip).await {
+                Some(hostname)
+            } else {
+                // Use async-compatible reverse DNS lookup
+                tokio::task::spawn_blocking(move || lookup_addr(&ip).ok())
+                    .await
+                    .unwrap_or(None)
+            };
+            
+            device.hostname = Some(host.unwrap_or_else(|| "N/A".to_string()));
             Ok(())
         }
     }
